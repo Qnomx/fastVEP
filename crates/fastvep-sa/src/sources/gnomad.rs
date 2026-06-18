@@ -21,6 +21,7 @@ use crate::common::AnnotationRecord;
 use crate::fields::{Field, FieldType};
 use crate::writer_v2::{Osa2Metadata, Osa2Record};
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 
@@ -196,15 +197,63 @@ fn parse_info_id(line: &str) -> Option<&str> {
     None
 }
 
+/// Data lines parsed per parallel batch. Lines are read sequentially (gzip
+/// decode is single-threaded), but per-line parsing — the dominant cost, far
+/// outweighing decode and block compression — is fanned out across cores with
+/// rayon. Bounded so peak memory stays modest on very wide gnomAD INFO columns.
+const PARSE_BATCH_LINES: usize = 16_384;
+
 /// Parse a gnomAD sites-only VCF and produce sorted `AnnotationRecord`s.
 ///
 /// Collects all records into memory and sorts. For genome-scale VCFs use
-/// `iter_gnomad_vcf` instead, which streams one block at a time.
+/// `iter_gnomad_vcf` instead, which streams one record at a time.
+///
+/// The header is read sequentially to detect the INFO field-naming scheme;
+/// data lines are then parsed in parallel batches via rayon. rayon preserves
+/// input order, and the final sort makes intra-parse ordering immaterial
+/// regardless, so the output is identical to a single-threaded parse.
 pub fn parse_gnomad_vcf<R: BufRead>(
     reader: R,
     chrom_to_idx: &HashMap<String, u16>,
 ) -> Result<Vec<AnnotationRecord>> {
-    let mut records: Vec<_> = iter_gnomad_vcf(reader, chrom_to_idx).collect::<Result<_>>()?;
+    let mut records = Vec::new();
+    let mut info_ids: HashSet<String> = HashSet::new();
+    let mut field_names = FieldNames::standard();
+    let mut header_done = false;
+    let mut batch: Vec<String> = Vec::with_capacity(PARSE_BATCH_LINES);
+
+    // Parse a batch of data lines across cores and append the results.
+    let flush =
+        |batch: &mut Vec<String>, records: &mut Vec<AnnotationRecord>, field_names: &FieldNames| {
+            let parsed: Vec<AnnotationRecord> = batch
+                .par_iter()
+                .flat_map_iter(|line| parse_gnomad_line(line, field_names, chrom_to_idx))
+                .collect();
+            records.extend(parsed);
+            batch.clear();
+        };
+
+    for line in reader.lines() {
+        let line = line.context("Reading gnomAD VCF line")?;
+        if !header_done {
+            if line.starts_with('#') {
+                if let Some(id) = parse_info_id(&line) {
+                    info_ids.insert(id.to_string());
+                }
+                continue;
+            }
+            // First data line: finalize the field-naming choice.
+            field_names = detect_field_names(&info_ids);
+            header_done = true;
+        }
+
+        batch.push(line);
+        if batch.len() >= PARSE_BATCH_LINES {
+            flush(&mut batch, &mut records, &field_names);
+        }
+    }
+    flush(&mut batch, &mut records, &field_names);
+
     records.sort_by(|a, b| {
         a.chrom_idx
             .cmp(&b.chrom_idx)
@@ -219,6 +268,9 @@ pub fn parse_gnomad_vcf<R: BufRead>(
 /// The input must already be sorted by chromosome and position (all standard
 /// gnomAD releases are). The writer will detect and error on out-of-order
 /// records.
+///
+/// Per-line parsing is shared with the parallel `parse_gnomad_vcf` path via
+/// `parse_gnomad_line`, so the two entry points cannot drift apart.
 pub fn iter_gnomad_vcf<'a, R: BufRead>(
     reader: R,
     chrom_to_idx: &'a HashMap<String, u16>,
@@ -265,77 +317,94 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
                 self.field_names = Some(detect_field_names(&self.info_ids));
             }
             let field_names = self.field_names.as_ref().unwrap();
-            let fields: Vec<&str> = line.splitn(9, '\t').collect();
-            if fields.len() < 8 {
-                continue;
-            }
 
-            let chrom = normalize_chrom(fields[0]);
-            let chrom_idx = match self.chrom_to_idx.get(&chrom) {
-                Some(&idx) => idx,
-                None => continue,
-            };
-
-            let pos: u32 = match fields[1].parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let ref_allele = fields[3].to_string();
-            let alt_field = fields[4];
-            // FILTER (column 7) is gnomAD's site/allele QC verdict — PASS or a
-            // semicolon-joined list such as AC0;AS_VQSR. It lives outside INFO and
-            // is required for the ACMG benign-frequency quality gate. "." is missing.
-            let filter = match fields[6] {
-                "." | "" => None,
-                f => Some(f),
-            };
-            let info = fields[7];
-
-            let info_map = parse_info(info);
-            let alts: Vec<&str> = alt_field.split(',').collect();
-            let all_afs = split_info_values(info_map.get(&field_names.af).map(|s| s.as_str()));
-            let all_ans = split_info_values(info_map.get(&field_names.an).map(|s| s.as_str()));
-            let all_acs = split_info_values(info_map.get(&field_names.ac).map(|s| s.as_str()));
-            let all_nhomalt =
-                split_info_values(info_map.get(&field_names.nhomalt).map(|s| s.as_str()));
-            let all_faf95 =
-                split_info_values(info_map.get(&field_names.faf95_max).map(|s| s.as_str()));
-            let all_faf99 =
-                split_info_values(info_map.get(&field_names.faf99_max).map(|s| s.as_str()));
-            let all_faf_gen_anc = split_info_values(
-                info_map
-                    .get(&field_names.faf95_max_gen_anc)
-                    .map(|s| s.as_str()),
-            );
-
-            for (i, alt) in alts.iter().enumerate() {
-                if *alt == "." || *alt == "*" {
-                    continue;
-                }
-                let json = build_gnomad_json(
-                    all_afs.get(i).map(|s| s.as_str()),
-                    all_ans.first().map(|s| s.as_str()),
-                    all_acs.get(i).map(|s| s.as_str()),
-                    all_nhomalt.get(i).map(|s| s.as_str()),
-                    all_faf95.get(i).map(|s| s.as_str()),
-                    all_faf99.get(i).map(|s| s.as_str()),
-                    all_faf_gen_anc.get(i).map(|s| s.as_str()),
-                    filter,
-                    &info_map,
-                    i,
-                    field_names,
-                );
-                self.pending.push_back(AnnotationRecord {
-                    chrom_idx,
-                    position: pos,
-                    ref_allele: ref_allele.clone(),
-                    alt_allele: alt.to_string(),
-                    json,
-                });
-            }
+            self.pending
+                .extend(parse_gnomad_line(&line, field_names, self.chrom_to_idx));
         }
     }
+}
+
+/// Parse a single gnomAD VCF data line into zero or more `AnnotationRecord`s
+/// (one per non-symbolic alt allele). Returns an empty vec for malformed lines,
+/// unmapped contigs, or unparseable positions — mirroring the skips the
+/// sequential parser performed via `continue`.
+fn parse_gnomad_line(
+    line: &str,
+    field_names: &FieldNames,
+    chrom_to_idx: &HashMap<String, u16>,
+) -> Vec<AnnotationRecord> {
+    let fields: Vec<&str> = line.splitn(9, '\t').collect();
+    if fields.len() < 8 {
+        return Vec::new();
+    }
+
+    let chrom = normalize_chrom(fields[0]);
+    let chrom_idx = match chrom_to_idx.get(&chrom) {
+        Some(&idx) => idx,
+        None => return Vec::new(),
+    };
+
+    let pos: u32 = match fields[1].parse() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    let ref_allele = fields[3];
+    let alt_field = fields[4];
+    // FILTER (column 7) is gnomAD's site/allele QC verdict — PASS or a
+    // semicolon-joined list such as AC0;AS_VQSR. It lives outside INFO and
+    // is required for the ACMG benign-frequency quality gate. "." is missing.
+    let filter = match fields[6] {
+        "." | "" => None,
+        f => Some(f),
+    };
+    let info = fields[7];
+
+    let info_map = parse_info(info);
+
+    // Handle multi-allelic: split allele-specific fields by comma
+    let alts: Vec<&str> = alt_field.split(',').collect();
+    let all_afs = split_info_values(info_map.get(&field_names.af).map(|s| s.as_str()));
+    let all_ans = split_info_values(info_map.get(&field_names.an).map(|s| s.as_str()));
+    let all_acs = split_info_values(info_map.get(&field_names.ac).map(|s| s.as_str()));
+    let all_nhomalt = split_info_values(info_map.get(&field_names.nhomalt).map(|s| s.as_str()));
+    let all_faf95 = split_info_values(info_map.get(&field_names.faf95_max).map(|s| s.as_str()));
+    let all_faf99 = split_info_values(info_map.get(&field_names.faf99_max).map(|s| s.as_str()));
+    let all_faf_gen_anc = split_info_values(
+        info_map
+            .get(&field_names.faf95_max_gen_anc)
+            .map(|s| s.as_str()),
+    );
+
+    let mut out = Vec::new();
+    for (i, alt) in alts.iter().enumerate() {
+        if *alt == "." || *alt == "*" {
+            continue;
+        }
+
+        let json = build_gnomad_json(
+            all_afs.get(i).map(|s| s.as_str()),
+            all_ans.first().map(|s| s.as_str()), // AN is site-wide, single-valued
+            all_acs.get(i).map(|s| s.as_str()),
+            all_nhomalt.get(i).map(|s| s.as_str()),
+            all_faf95.get(i).map(|s| s.as_str()),
+            all_faf99.get(i).map(|s| s.as_str()),
+            all_faf_gen_anc.get(i).map(|s| s.as_str()),
+            filter,
+            &info_map,
+            i,
+            field_names,
+        );
+
+        out.push(AnnotationRecord {
+            chrom_idx,
+            position: pos,
+            ref_allele: ref_allele.to_string(),
+            alt_allele: alt.to_string(),
+            json,
+        });
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
