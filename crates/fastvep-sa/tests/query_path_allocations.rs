@@ -7,9 +7,12 @@
 //! Both readers now invert the alias rules once at open into a map, so a query
 //! resolves its chromosome with one hash lookup and no allocation.
 //!
-//! This file installs a counting global allocator, so it deliberately holds
-//! exactly ONE test: `cargo test` runs the tests in a binary concurrently, and a
-//! second test allocating on another thread would be counted here.
+//! The counting allocator counts per thread. Building the `.osa` fixture calls
+//! `SaWriter::write_to_files`, which compresses blocks with rayon, and those
+//! worker threads allocate while starting up. A process-wide count includes
+//! them, which makes the totals below depend on thread scheduling. The budget
+//! covers the calling thread only, which is correct while the query path is
+//! single-threaded.
 
 use fastvep_cache::annotation::AnnotationProvider;
 use fastvep_sa::common::AnnotationRecord;
@@ -21,22 +24,31 @@ use fastvep_sa::reader_v2::Osa2Reader;
 use fastvep_sa::writer::SaWriter;
 use fastvep_sa::writer_v2::{Osa2Metadata, Osa2Record, Osa2Writer};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The cell must stay const-initialised and must not implement `Drop`. A lazily
+/// initialised thread-local allocates on first access, which would re-enter
+/// this allocator.
+fn count_one() {
+    let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+}
 
 struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        count_one();
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        count_one();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -46,9 +58,9 @@ static ALLOCATOR: Counting = Counting;
 
 /// Allocations performed while running `f`.
 fn allocations_during<F: FnOnce()>(f: F) -> usize {
-    let before = ALLOCS.load(Ordering::Relaxed);
+    let before = ALLOCS.with(|c| c.get());
     f();
-    ALLOCS.load(Ordering::Relaxed) - before
+    ALLOCS.with(|c| c.get()) - before
 }
 
 fn v2_metadata() -> Osa2Metadata {
