@@ -8,8 +8,35 @@ use crate::block::{BlockEntry, SaBlock};
 use crate::common::{AnnotationRecord, DEFAULT_BLOCK_SIZE, OSA_MAGIC, SCHEMA_VERSION};
 use crate::index::{BlockRef, IndexHeader, SaIndex};
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+
+/// A block partitioned off and ready to be compressed, retaining the index
+/// metadata that must be recorded once its compressed length is known.
+struct PendingBlock {
+    chrom: String,
+    start_pos: u32,
+    end_pos: u32,
+    block: SaBlock,
+}
+
+/// Push the current block onto `blocks` (capturing its index metadata) and
+/// reset it to empty. No-op when the block holds no entries.
+fn finalize_block(block: &mut SaBlock, chrom: &str, blocks: &mut Vec<PendingBlock>) {
+    if block.is_empty() {
+        return;
+    }
+    let start_pos = block.start_position().unwrap();
+    let end_pos = block.end_position().unwrap();
+    let finished = std::mem::replace(block, SaBlock::new(DEFAULT_BLOCK_SIZE));
+    blocks.push(PendingBlock {
+        chrom: chrom.to_string(),
+        start_pos,
+        end_pos,
+        block: finished,
+    });
+}
 
 /// Builds an .osa data file and its .osa.idx index file.
 pub struct SaWriter {
@@ -38,6 +65,14 @@ impl SaWriter {
     ///
     /// Records MUST be sorted by (chrom_idx, position).
     /// `chrom_map` maps chrom_idx -> chromosome name string.
+    ///
+    /// The records are partitioned into blocks sequentially (preserving order
+    /// and the block-size/chromosome boundaries), the blocks are zstd-compressed
+    /// in parallel via rayon (compression is CPU-bound and per-block
+    /// independent), then written and indexed sequentially so the on-disk layout
+    /// is byte-identical to a single-threaded build. All records are
+    /// materialised into blocks first; callers that must stream without holding
+    /// every record in memory should use [`Self::write_all_results`].
     pub fn write_all<W: Write>(
         &mut self,
         data_writer: &mut W,
@@ -45,18 +80,90 @@ impl SaWriter {
         chrom_map: &[String],
     ) -> Result<()> {
         self.chrom_names = chrom_map.to_vec();
+        let blocks = Self::collect_blocks(records.map(Ok), chrom_map)?;
+        self.write_compressed_blocks(data_writer, blocks)
+    }
 
-        // Write data file header
+    /// Partition sorted records into blocks without compressing them, applying
+    /// the same sort validation and block/chromosome boundary rules as the
+    /// streaming path.
+    fn collect_blocks(
+        records: impl Iterator<Item = Result<AnnotationRecord>>,
+        chrom_map: &[String],
+    ) -> Result<Vec<PendingBlock>> {
+        let mut blocks: Vec<PendingBlock> = Vec::new();
+        let mut current_chrom: Option<String> = None;
+        let mut last_key: Option<(u16, u32)> = None;
+        let mut block = SaBlock::new(DEFAULT_BLOCK_SIZE);
+
+        for record in records {
+            let record = record?;
+            if let Some((last_chrom, last_pos)) = last_key {
+                if (record.chrom_idx, record.position) < (last_chrom, last_pos) {
+                    anyhow::bail!(
+                        "SA records are not sorted: previous chrom_idx={}, position={}; current chrom_idx={}, position={}",
+                        last_chrom,
+                        last_pos,
+                        record.chrom_idx,
+                        record.position
+                    );
+                }
+            }
+            last_key = Some((record.chrom_idx, record.position));
+
+            let chrom_name = &chrom_map[record.chrom_idx as usize];
+            if current_chrom.as_deref() != Some(chrom_name.as_str()) {
+                finalize_block(&mut block, current_chrom.as_deref().unwrap_or(""), &mut blocks);
+                current_chrom = Some(chrom_name.clone());
+            }
+
+            let entry = BlockEntry {
+                position: record.position,
+                ref_allele: record.ref_allele,
+                alt_allele: record.alt_allele,
+                json: record.json,
+            };
+
+            if !block.add(entry.clone()) {
+                finalize_block(&mut block, current_chrom.as_deref().unwrap(), &mut blocks);
+                assert!(block.add(entry), "Single entry exceeds block size");
+            }
+        }
+
+        finalize_block(&mut block, current_chrom.as_deref().unwrap_or(""), &mut blocks);
+        Ok(blocks)
+    }
+
+    /// Compress all blocks in parallel, then write and index them sequentially.
+    fn write_compressed_blocks<W: Write>(
+        &mut self,
+        data_writer: &mut W,
+        blocks: Vec<PendingBlock>,
+    ) -> Result<()> {
         data_writer.write_all(OSA_MAGIC)?;
         data_writer.write_all(&SCHEMA_VERSION.to_le_bytes())?;
         self.data_offset = (OSA_MAGIC.len() + 2) as u64;
 
-        for record in records {
-            self.write_record(data_writer, record, chrom_map)?;
-        }
+        let compressed: Vec<Vec<u8>> = blocks
+            .par_iter()
+            .map(|pending| pending.block.compress())
+            .collect::<Result<Vec<_>>>()?;
 
-        // Flush remaining
-        self.flush_block(data_writer)?;
+        for (pending, data) in blocks.iter().zip(compressed) {
+            let compressed_len = data.len() as u32;
+            data_writer.write_all(&compressed_len.to_le_bytes())?;
+            data_writer.write_all(&data)?;
+            self.index.add_block(
+                &pending.chrom,
+                BlockRef {
+                    start_pos: pending.start_pos,
+                    end_pos: pending.end_pos,
+                    file_offset: self.data_offset,
+                    compressed_len,
+                },
+            );
+            self.data_offset += 4 + compressed_len as u64;
+        }
         Ok(())
     }
 
@@ -256,5 +363,43 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("SA records are not sorted"));
+    }
+
+    #[test]
+    fn write_all_preserves_order_across_blocks() {
+        // Each chromosome change starts a new block, so this produces three
+        // blocks that are compressed in parallel and must be written back in
+        // the original order. Decompressing the data stream must reproduce the
+        // input records in order.
+        use crate::block::SaBlock;
+
+        let mut writer = SaWriter::new(header());
+        let mut out = Vec::new();
+        let records = vec![record(0, 10), record(0, 20), record(1, 5), record(2, 100)];
+        writer
+            .write_all(
+                &mut out,
+                records.into_iter(),
+                &["1".into(), "2".into(), "3".into()],
+            )
+            .unwrap();
+
+        // Walk the data stream: magic + schema version, then length-prefixed
+        // compressed blocks.
+        let mut cursor = OSA_MAGIC.len() + 2;
+        let mut positions = Vec::new();
+        let mut block_count = 0;
+        while cursor < out.len() {
+            let len =
+                u32::from_le_bytes(out[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let entries = SaBlock::decompress(&out[cursor..cursor + len]).unwrap();
+            positions.extend(entries.iter().map(|e| e.position));
+            cursor += len;
+            block_count += 1;
+        }
+
+        assert_eq!(block_count, 3, "one block per chromosome");
+        assert_eq!(positions, vec![10, 20, 5, 100]);
     }
 }
