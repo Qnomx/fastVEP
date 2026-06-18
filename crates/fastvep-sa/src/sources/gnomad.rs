@@ -28,7 +28,16 @@ use std::io::BufRead;
 /// gnomAD v2.1 codes (`oth`) and the v4.1 codes (`mid`, `remaining`); a
 /// missing key is silently skipped per VCF, so listing all is harmless.
 const POPULATIONS: &[&str] = &[
-    "afr", "amr", "asj", "eas", "fin", "mid", "nfe", "oth", "remaining", "sas",
+    "afr",
+    "amr",
+    "asj",
+    "eas",
+    "fin",
+    "mid",
+    "nfe",
+    "oth",
+    "remaining",
+    "sas",
 ];
 
 /// INFO field names for a particular gnomAD release flavor.
@@ -41,9 +50,20 @@ struct FieldNames {
     an: String,
     ac: String,
     nhomalt: String,
-    /// Format string for per-population AF, with `{}` substituted for the
-    /// population code (e.g., `"AF_{}"` or `"AF_joint_{}"`).
+    /// Format strings for per-population fields, with `{}` substituted for the
+    /// population code (e.g. `"AF_{}"` / `"AF_joint_{}"`). gnomAD reports
+    /// per-population AF/AC/nhomalt per alt allele and AN once per population.
     af_pop_template: String,
+    an_pop_template: String,
+    ac_pop_template: String,
+    nhomalt_pop_template: String,
+    /// gnomAD's precomputed grpmax filtering allele frequency (the ACMG
+    /// BA1/BS1 quantity) and the genetic-ancestry group it was drawn from. The
+    /// separate exomes/genomes VCFs expose `fafmax_faf95_max`; the joint VCF
+    /// suffixes `_joint`. Absent in pre-v4 releases, which simply yield no FAF.
+    faf95_max: String,
+    faf99_max: String,
+    faf95_max_gen_anc: String,
 }
 
 impl FieldNames {
@@ -54,6 +74,12 @@ impl FieldNames {
             ac: "AC".into(),
             nhomalt: "nhomalt".into(),
             af_pop_template: "AF_{}".into(),
+            an_pop_template: "AN_{}".into(),
+            ac_pop_template: "AC_{}".into(),
+            nhomalt_pop_template: "nhomalt_{}".into(),
+            faf95_max: "fafmax_faf95_max".into(),
+            faf99_max: "fafmax_faf99_max".into(),
+            faf95_max_gen_anc: "fafmax_faf95_max_gen_anc".into(),
         }
     }
 
@@ -64,11 +90,29 @@ impl FieldNames {
             ac: "AC_joint".into(),
             nhomalt: "nhomalt_joint".into(),
             af_pop_template: "AF_joint_{}".into(),
+            an_pop_template: "AN_joint_{}".into(),
+            ac_pop_template: "AC_joint_{}".into(),
+            nhomalt_pop_template: "nhomalt_joint_{}".into(),
+            faf95_max: "fafmax_faf95_max_joint".into(),
+            faf99_max: "fafmax_faf99_max_joint".into(),
+            faf95_max_gen_anc: "fafmax_faf95_max_joint_gen_anc".into(),
         }
     }
 
-    fn pop_key(&self, pop: &str) -> String {
+    fn af_pop_key(&self, pop: &str) -> String {
         self.af_pop_template.replace("{}", pop)
+    }
+
+    fn an_pop_key(&self, pop: &str) -> String {
+        self.an_pop_template.replace("{}", pop)
+    }
+
+    fn ac_pop_key(&self, pop: &str) -> String {
+        self.ac_pop_template.replace("{}", pop)
+    }
+
+    fn nhomalt_pop_key(&self, pop: &str) -> String {
+        self.nhomalt_pop_template.replace("{}", pop)
     }
 }
 
@@ -161,7 +205,11 @@ pub fn parse_gnomad_vcf<R: BufRead>(
     chrom_to_idx: &HashMap<String, u16>,
 ) -> Result<Vec<AnnotationRecord>> {
     let mut records: Vec<_> = iter_gnomad_vcf(reader, chrom_to_idx).collect::<Result<_>>()?;
-    records.sort_by(|a, b| a.chrom_idx.cmp(&b.chrom_idx).then(a.position.cmp(&b.position)));
+    records.sort_by(|a, b| {
+        a.chrom_idx
+            .cmp(&b.chrom_idx)
+            .then(a.position.cmp(&b.position))
+    });
     Ok(records)
 }
 
@@ -217,7 +265,6 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
                 self.field_names = Some(detect_field_names(&self.info_ids));
             }
             let field_names = self.field_names.as_ref().unwrap();
-
             let fields: Vec<&str> = line.splitn(9, '\t').collect();
             if fields.len() < 8 {
                 continue;
@@ -236,6 +283,13 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
 
             let ref_allele = fields[3].to_string();
             let alt_field = fields[4];
+            // FILTER (column 7) is gnomAD's site/allele QC verdict — PASS or a
+            // semicolon-joined list such as AC0;AS_VQSR. It lives outside INFO and
+            // is required for the ACMG benign-frequency quality gate. "." is missing.
+            let filter = match fields[6] {
+                "." | "" => None,
+                f => Some(f),
+            };
             let info = fields[7];
 
             let info_map = parse_info(info);
@@ -245,6 +299,15 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
             let all_acs = split_info_values(info_map.get(&field_names.ac).map(|s| s.as_str()));
             let all_nhomalt =
                 split_info_values(info_map.get(&field_names.nhomalt).map(|s| s.as_str()));
+            let all_faf95 =
+                split_info_values(info_map.get(&field_names.faf95_max).map(|s| s.as_str()));
+            let all_faf99 =
+                split_info_values(info_map.get(&field_names.faf99_max).map(|s| s.as_str()));
+            let all_faf_gen_anc = split_info_values(
+                info_map
+                    .get(&field_names.faf95_max_gen_anc)
+                    .map(|s| s.as_str()),
+            );
 
             for (i, alt) in alts.iter().enumerate() {
                 if *alt == "." || *alt == "*" {
@@ -255,6 +318,10 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
                     all_ans.first().map(|s| s.as_str()),
                     all_acs.get(i).map(|s| s.as_str()),
                     all_nhomalt.get(i).map(|s| s.as_str()),
+                    all_faf95.get(i).map(|s| s.as_str()),
+                    all_faf99.get(i).map(|s| s.as_str()),
+                    all_faf_gen_anc.get(i).map(|s| s.as_str()),
+                    filter,
                     &info_map,
                     i,
                     field_names,
@@ -271,60 +338,114 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_gnomad_json(
     af: Option<&str>,
     an: Option<&str>,
     ac: Option<&str>,
     nhomalt: Option<&str>,
+    faf95_max: Option<&str>,
+    faf99_max: Option<&str>,
+    faf95_max_gen_anc: Option<&str>,
+    filter: Option<&str>,
     info_map: &HashMap<String, String>,
     allele_idx: usize,
     field_names: &FieldNames,
 ) -> String {
     let mut parts = Vec::new();
 
-    if let Some(af_str) = af {
-        if let Ok(f) = af_str.parse::<f64>() {
-            parts.push(format!("\"allAf\":{:.6e}", f));
-        }
-    }
-
-    // AN/AC/nhomalt are written unquoted, so each must be a validated
-    // non-negative integer — raw INFO-field text (e.g. the "." missing-value
-    // sentinel or other garbage) would otherwise land in the JSON as a bare,
-    // unquoted token and break every downstream serde_json::from_str on this
-    // record. Mirrors the CNT validation in sources/cosmic.rs.
-    if let Some(an_str) = an {
-        if let Ok(n) = an_str.parse::<u64>() {
-            parts.push(format!("\"allAn\":{}", n));
-        }
-    }
-
-    if let Some(ac_str) = ac {
-        if let Ok(n) = ac_str.parse::<u64>() {
-            parts.push(format!("\"allAc\":{}", n));
-        }
-    }
-
-    if let Some(nh) = nhomalt {
-        if let Ok(n) = nh.parse::<u64>() {
-            parts.push(format!("\"allHc\":{}", n));
-        }
-    }
-
-    // Per-population AFs
-    for pop in POPULATIONS {
-        let key = field_names.pop_key(pop);
-        if let Some(val) = info_map.get(&key) {
-            let vals = split_info_values(Some(val.as_str()));
-            if let Some(af_str) = vals.get(allele_idx) {
-                if let Ok(f) = af_str.parse::<f64>() {
-                    parts.push(format!("\"{}Af\":{:.6e}", pop, f));
-                }
+    // Emit a floating-point field, skipping missing/non-numeric values.
+    let push_float = |parts: &mut Vec<String>, key: &str, value: Option<&str>| {
+        if let Some(s) = value {
+            if let Ok(f) = s.parse::<f64>() {
+                parts.push(format!("\"{}\":{:.6e}", key, f));
             }
+        }
+    };
+    // Emit an integer field, skipping missing/non-numeric values. Parsing
+    // guards against "." placeholders that would otherwise yield invalid JSON.
+    let push_int = |parts: &mut Vec<String>, key: &str, value: Option<&str>| {
+        if let Some(s) = value {
+            if let Ok(n) = s.parse::<i64>() {
+                parts.push(format!("\"{}\":{}", key, n));
+            }
+        }
+    };
+
+    // Global (whole-dataset) frequency, allele counts, and homozygote count.
+    push_float(&mut parts, "allAf", af);
+    push_int(&mut parts, "allAn", an);
+    push_int(&mut parts, "allAc", ac);
+    push_int(&mut parts, "allHc", nhomalt);
+
+    // gnomAD's precomputed grpmax filtering allele frequency (95% / 99% CI)
+    // and the genetic-ancestry group it was drawn from.
+    push_float(&mut parts, "faf95Max", faf95_max);
+    push_float(&mut parts, "faf99Max", faf99_max);
+    if let Some(gen_anc) = faf95_max_gen_anc {
+        if !gen_anc.is_empty() && gen_anc != "." {
+            parts.push(format!("\"faf95MaxGenAnc\":{}", json_string(gen_anc)));
+        }
+    }
+
+    // FILTER verdict (PASS or a semicolon-joined list of failure flags).
+    if let Some(f) = filter {
+        parts.push(format!("\"filter\":{}", json_string(f)));
+    }
+
+    // Per-population AF, AC, AN, and homozygote count. AF/AC/nhomalt are
+    // per alt allele (indexed); AN is reported once per population.
+    for pop in POPULATIONS {
+        if let Some(val) = info_map.get(&field_names.af_pop_key(pop)) {
+            let vals = split_info_values(Some(val.as_str()));
+            push_float(
+                &mut parts,
+                &format!("{}Af", pop),
+                vals.get(allele_idx).map(|s| s.as_str()),
+            );
+        }
+        if let Some(val) = info_map.get(&field_names.ac_pop_key(pop)) {
+            let vals = split_info_values(Some(val.as_str()));
+            push_int(
+                &mut parts,
+                &format!("{}Ac", pop),
+                vals.get(allele_idx).map(|s| s.as_str()),
+            );
+        }
+        if let Some(val) = info_map.get(&field_names.an_pop_key(pop)) {
+            let vals = split_info_values(Some(val.as_str()));
+            push_int(
+                &mut parts,
+                &format!("{}An", pop),
+                vals.first().map(|s| s.as_str()),
+            );
+        }
+        if let Some(val) = info_map.get(&field_names.nhomalt_pop_key(pop)) {
+            let vals = split_info_values(Some(val.as_str()));
+            push_int(
+                &mut parts,
+                &format!("{}Hc", pop),
+                vals.get(allele_idx).map(|s| s.as_str()),
+            );
         }
     }
 
     format!("{{{}}}", parts.join(","))
+}
+
+/// Quote and escape a string for safe inclusion in the hand-built JSON blob.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn parse_info(info: &str) -> HashMap<String, String> {
@@ -517,14 +638,23 @@ impl<R: BufRead> Iterator for GnomadOsa2Iter<'_, R> {
                 }
                 // Value order MUST match `gnomad_osa2_fields()`.
                 let mut values = Vec::with_capacity(self.fields.len());
-                values.push(enc_float(&self.fields[0], all_afs.get(ai).map(|s| s.as_str())));
+                values.push(enc_float(
+                    &self.fields[0],
+                    all_afs.get(ai).map(|s| s.as_str()),
+                ));
                 values.push(enc_int(&self.fields[1], an.first().map(|s| s.as_str())));
-                values.push(enc_int(&self.fields[2], all_acs.get(ai).map(|s| s.as_str())));
+                values.push(enc_int(
+                    &self.fields[2],
+                    all_acs.get(ai).map(|s| s.as_str()),
+                ));
                 values.push(enc_int(&self.fields[3], all_nh.get(ai).map(|s| s.as_str())));
                 for (pi, pop) in POPULATIONS.iter().enumerate() {
-                    let key = field_names.pop_key(pop);
+                    let key = field_names.af_pop_key(pop);
                     let vals = split_info_values(info_map.get(&key).map(|s| s.as_str()));
-                    values.push(enc_float(&self.fields[4 + pi], vals.get(ai).map(|s| s.as_str())));
+                    values.push(enc_float(
+                        &self.fields[4 + pi],
+                        vals.get(ai).map(|s| s.as_str()),
+                    ));
                 }
 
                 self.pending.push_back(Osa2Record {
@@ -672,6 +802,7 @@ chr1\t20000\t.\tC\tT,A\t.\tPASS\tAF_joint=0.01,0.005;AN_joint=140000;AC_joint=14
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
 chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=not_a_number;AC=garbage;nhomalt=.
 ";
+
         let mut chrom_map = HashMap::new();
         chrom_map.insert("chr1".to_string(), 0u16);
 
@@ -684,6 +815,142 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=not_a_number;AC=garbage;nhomalt=.
         // The emitted JSON must still be valid.
         let v: serde_json::Value = serde_json::from_str(&records[0].json).unwrap();
         assert!(v.get("allAf").is_some());
+    }
+
+    #[test]
+    fn test_parse_gnomad_per_population_counts() {
+        // Per-population AC/AN/nhomalt (not just AF) must be surfaced, and the
+        // FILTER column and grpmax FAF must be captured.
+        let vcf = "\
+##fileformat=VCFv4.2
+##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">
+##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total allele number\">
+##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">
+##INFO=<ID=nhomalt,Number=A,Type=Integer,Description=\"Homozygote count\">
+##INFO=<ID=AF_nfe,Number=A,Type=Float,Description=\"AF NFE\">
+##INFO=<ID=AN_nfe,Number=1,Type=Integer,Description=\"AN NFE\">
+##INFO=<ID=AC_nfe,Number=A,Type=Integer,Description=\"AC NFE\">
+##INFO=<ID=nhomalt_nfe,Number=A,Type=Integer,Description=\"nhomalt NFE\">
+##INFO=<ID=fafmax_faf95_max,Number=A,Type=Float,Description=\"grpmax FAF95\">
+##INFO=<ID=fafmax_faf99_max,Number=A,Type=Float,Description=\"grpmax FAF99\">
+##INFO=<ID=fafmax_faf95_max_gen_anc,Number=A,Type=String,Description=\"grpmax FAF95 group\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
+chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_nfe=0.0005;AN_nfe=60000;AC_nfe=30;nhomalt_nfe=1;fafmax_faf95_max=0.0004;fafmax_faf99_max=0.0003;fafmax_faf95_max_gen_anc=nfe
+";
+
+        let mut chrom_map = HashMap::new();
+        chrom_map.insert("chr1".to_string(), 0u16);
+
+        let records = parse_gnomad_vcf(vcf.as_bytes(), &chrom_map).unwrap();
+        assert_eq!(records.len(), 1);
+        let json = &records[0].json;
+
+        // Per-population counts, not just AF.
+        assert!(json.contains("\"nfeAf\":"), "missing nfeAf in: {}", json);
+        assert!(
+            json.contains("\"nfeAn\":60000"),
+            "missing nfeAn in: {}",
+            json
+        );
+        assert!(json.contains("\"nfeAc\":30"), "missing nfeAc in: {}", json);
+        assert!(json.contains("\"nfeHc\":1"), "missing nfeHc in: {}", json);
+        // grpmax filtering allele frequency and its source group.
+        assert!(
+            json.contains("\"faf95Max\":"),
+            "missing faf95Max in: {}",
+            json
+        );
+        assert!(
+            json.contains("\"faf99Max\":"),
+            "missing faf99Max in: {}",
+            json
+        );
+        assert!(
+            json.contains("\"faf95MaxGenAnc\":\"nfe\""),
+            "missing faf95MaxGenAnc in: {}",
+            json
+        );
+        // FILTER verdict.
+        assert!(
+            json.contains("\"filter\":\"PASS\""),
+            "missing filter in: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_parse_gnomad_filter_failure_flags() {
+        // A non-PASS FILTER (semicolon-joined failure flags) must be preserved
+        // verbatim for the downstream quality gate.
+        let vcf = "\
+##fileformat=VCFv4.2
+##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">
+##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total allele number\">
+##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
+chr1\t10001\t.\tA\tG\t.\tAC0;AS_VQSR\tAF=0.001;AN=150000;AC=150
+chr2\t20001\t.\tC\tT\t.\t.\tAF=0.002;AN=140000;AC=280
+";
+
+        let mut chrom_map = HashMap::new();
+        chrom_map.insert("chr1".to_string(), 0u16);
+        chrom_map.insert("chr2".to_string(), 1u16);
+
+        let records = parse_gnomad_vcf(vcf.as_bytes(), &chrom_map).unwrap();
+        assert_eq!(records.len(), 2);
+
+        let failed = records.iter().find(|r| r.position == 10001).unwrap();
+        assert!(
+            failed.json.contains("\"filter\":\"AC0;AS_VQSR\""),
+            "missing failure filter in: {}",
+            failed.json
+        );
+        // A "." FILTER means missing and must not emit a filter field.
+        let missing = records.iter().find(|r| r.position == 20001).unwrap();
+        assert!(
+            !missing.json.contains("\"filter\":"),
+            "'.' FILTER should be omitted, got: {}",
+            missing.json
+        );
+    }
+
+    #[test]
+    fn test_parse_gnomad_joint_faf_and_pop_counts() {
+        // The joint release suffixes both the FAF and per-population count
+        // fields with _joint; detection must route to them.
+        let vcf = "\
+##fileformat=VCFv4.2
+##INFO=<ID=AF_joint,Number=A,Type=Float,Description=\"Joint AF\">
+##INFO=<ID=AN_joint,Number=1,Type=Integer,Description=\"Joint AN\">
+##INFO=<ID=AC_joint,Number=A,Type=Integer,Description=\"Joint AC\">
+##INFO=<ID=AC_joint_nfe,Number=A,Type=Integer,Description=\"Joint AC NFE\">
+##INFO=<ID=AN_joint_nfe,Number=1,Type=Integer,Description=\"Joint AN NFE\">
+##INFO=<ID=fafmax_faf95_max_joint,Number=A,Type=Float,Description=\"Joint grpmax FAF95\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
+chr1\t10001\t.\tA\tG\t.\tPASS\tAF_joint=0.001;AN_joint=150000;AC_joint=150;AC_joint_nfe=30;AN_joint_nfe=60000;fafmax_faf95_max_joint=0.0004
+";
+
+        let mut chrom_map = HashMap::new();
+        chrom_map.insert("chr1".to_string(), 0u16);
+
+        let records = parse_gnomad_vcf(vcf.as_bytes(), &chrom_map).unwrap();
+        assert_eq!(records.len(), 1);
+        let json = &records[0].json;
+        assert!(
+            json.contains("\"nfeAc\":30"),
+            "missing joint nfeAc in: {}",
+            json
+        );
+        assert!(
+            json.contains("\"nfeAn\":60000"),
+            "missing joint nfeAn in: {}",
+            json
+        );
+        assert!(
+            json.contains("\"faf95Max\":"),
+            "missing joint faf95Max in: {}",
+            json
+        );
     }
 
     #[test]
@@ -705,8 +972,8 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=not_a_number;AC=garbage;nhomalt=.
         ids.insert("AF-nfe".into());
         let names = detect_field_names(&ids);
         assert_eq!(names.af, "AF");
-        assert_eq!(names.pop_key("afr"), "AF-afr");
-        assert_eq!(names.pop_key("nfe"), "AF-nfe");
+        assert_eq!(names.af_pop_key("afr"), "AF-afr");
+        assert_eq!(names.af_pop_key("nfe"), "AF-nfe");
     }
 
     #[test]
@@ -716,7 +983,10 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=not_a_number;AC=garbage;nhomalt=.
         ids.insert("AC_joint".into());
         let names = detect_field_names(&ids);
         assert_eq!(names.af, "AF_joint");
-        assert_eq!(names.pop_key("nfe"), "AF_joint_nfe");
+        assert_eq!(names.af_pop_key("nfe"), "AF_joint_nfe");
+        assert_eq!(names.an_pop_key("nfe"), "AN_joint_nfe");
+        assert_eq!(names.ac_pop_key("nfe"), "AC_joint_nfe");
+        assert_eq!(names.nhomalt_pop_key("nfe"), "nhomalt_joint_nfe");
     }
 
     #[test]
@@ -735,8 +1005,7 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=not_a_number;AC=garbage;nhomalt=.
     #[test]
     fn test_parse_info_id_reordered_with_quoted_comma() {
         // Description quoted string contains commas — must not split inside it.
-        let line =
-            "##INFO=<Number=A,Type=Float,Description=\"AF, joint, multi-pop\",ID=AF_joint>";
+        let line = "##INFO=<Number=A,Type=Float,Description=\"AF, joint, multi-pop\",ID=AF_joint>";
         assert_eq!(parse_info_id(line), Some("AF_joint"));
     }
 
@@ -794,8 +1063,9 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_afr=0.002;
 chr1\t20000\t.\tC\tT,A\t.\tPASS\tAF=0.01,0.005;AN=140000;AC=1400,700;nhomalt=10,3;AF_eas=0.02,0.01
 ";
         let map = chr1_map();
-        let recs: Vec<Osa2Record> =
-            iter_gnomad_osa2(vcf.as_bytes(), &map).collect::<Result<_>>().unwrap();
+        let recs: Vec<Osa2Record> = iter_gnomad_osa2(vcf.as_bytes(), &map)
+            .collect::<Result<_>>()
+            .unwrap();
         assert_eq!(recs.len(), 3); // 1 SNV + 2 from the multi-allelic site
 
         let fields = gnomad_osa2_fields();
@@ -805,7 +1075,7 @@ chr1\t20000\t.\tC\tT,A\t.\tPASS\tAF=0.01,0.005;AN=140000;AC=1400,700;nhomalt=10,
         assert_eq!(recs[0].values[1], 150000); // AN
         assert_eq!(recs[0].values[2], 150); // AC
         assert_eq!(recs[0].values[3], 2); // nhomalt
-        // afr AF present, sas AF missing.
+                                          // afr AF present, sas AF missing.
         let afr_idx = 4 + POPULATIONS.iter().position(|p| *p == "afr").unwrap();
         let sas_idx = 4 + POPULATIONS.iter().position(|p| *p == "sas").unwrap();
         assert_eq!(recs[0].values[afr_idx], fields[afr_idx].encode_float(0.002));
@@ -831,8 +1101,9 @@ chr1\t20000\t.\tC\tT,A\t.\tPASS\tAF=0.01,0.005;AN=140000;AC=1400,700;nhomalt=10,
 chr1\t10001\t.\tA\tG\t.\tPASS\tAF_joint=0.001;AN_joint=150000;AC_joint=150;AF_joint_nfe=0.0005
 ";
         let map = chr1_map();
-        let recs: Vec<Osa2Record> =
-            iter_gnomad_osa2(vcf.as_bytes(), &map).collect::<Result<_>>().unwrap();
+        let recs: Vec<Osa2Record> = iter_gnomad_osa2(vcf.as_bytes(), &map)
+            .collect::<Result<_>>()
+            .unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].values[0], 2000); // AF_joint 0.001 encoded
         assert_eq!(recs[0].values[1], 150000); // AN_joint
@@ -850,8 +1121,9 @@ chr2\t100\t.\tA\tG\t.\tPASS\tAF=0.5
 chr1\t200\t.\tA\tG\t.\tPASS\tAF=0.5
 ";
         let map = chr1_map(); // only chr1 is valid
-        let recs: Vec<Osa2Record> =
-            iter_gnomad_osa2(vcf.as_bytes(), &map).collect::<Result<_>>().unwrap();
+        let recs: Vec<Osa2Record> = iter_gnomad_osa2(vcf.as_bytes(), &map)
+            .collect::<Result<_>>()
+            .unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].chrom, "chr1");
         assert_eq!(recs[0].position, 200);
