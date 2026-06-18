@@ -727,7 +727,7 @@ pub fn run_sa_build_v2(
                 &out_path,
                 &gnomad::gnomad_osa2_metadata(assembly),
                 gnomad::gnomad_osa2_fields(),
-                &[],
+                &gnomad::gnomad_string_tables(),
                 records,
                 meter,
                 input,
