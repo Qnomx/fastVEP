@@ -150,6 +150,14 @@ pub fn hgvsp_inframe_indel(
     let prefix = format!("{}:p.", protein_id);
     let fallback = || unshifted_description(&prefix, protein_start, &original_ref, &original_alt);
 
+    // Transcript::peptide runs to cdna_coding_end, so it carries the terminator
+    // as a final `*` — and anything translated past an internal one on a
+    // mis-annotated CDS. Those residues are not part of the protein, so bound
+    // the peptide at the first terminator before shifting against it.
+    let ref_peptide = ref_peptide.map(|p| match p.iter().position(|&b| b == b'*') {
+        Some(terminator) => &p[..terminator],
+        None => p,
+    });
     let peptide = ref_peptide.filter(|p| peptide_carries(p, protein_start, &original_ref));
 
     // Reduce to the minimal changed region: residues shared at either end are
@@ -537,6 +545,32 @@ mod tests {
         for (name, start, reference, alternate, pep, expected) in cases {
             let got = hgvsp_inframe_indel("ENSP00000001", start, reference, alternate, Some(pep));
             assert_eq!(got.as_deref(), expected, "case: {name}");
+        }
+    }
+
+    #[test]
+    fn test_hgvsp_inframe_indel_does_not_shift_onto_the_terminator() {
+        // Transcript::peptide ends with `*`. A change abutting the stop must not
+        // shift onto it or name it as a flanking residue: Ter is not a residue
+        // of the protein, and a position at or past it is not a real position.
+        let pep: Vec<u8> = "MKKG*".bytes().collect();
+
+        // Deleting one Lys from the KK run shifts to the 3'-most Lys (3), not
+        // onto Gly4 or the terminator.
+        let deletion = hgvsp_inframe_indel("ENSP00000001", 2, "K", "-", Some(&pep));
+        assert_eq!(deletion, Some("ENSP00000001:p.Lys3del".to_string()));
+
+        // An insertion immediately before the terminator has no residue on its
+        // 3' side once the stop is excluded, so it falls back rather than
+        // emitting a Ter-flanked range.
+        let insertion = hgvsp_inframe_indel("ENSP00000001", 4, "G", "GS", Some(&pep));
+        assert_eq!(
+            insertion,
+            Some("ENSP00000001:p.Gly4delinsGlySer".to_string())
+        );
+        for out in [deletion, insertion] {
+            let out = out.unwrap();
+            assert!(!out.contains("Ter"), "terminator named as a residue: {out}");
         }
     }
 
