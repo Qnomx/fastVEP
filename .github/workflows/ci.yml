@@ -1,10 +1,12 @@
 name: CI
 
 on:
+  # Every pull request, whatever it targets. Filtering by base branch meant a PR
+  # into an integration branch got no checks at all, which is exactly where work
+  # lands before it reaches master.
   pull_request:
-    branches: [master]
   push:
-    branches: [master]
+    branches: [master, qnomx-integration]
 
 permissions:
   contents: read
