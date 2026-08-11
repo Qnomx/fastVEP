@@ -80,6 +80,21 @@ run_human() {
         echo "  Skipping VEP for now — use compare_vep.py on existing results"
     fi
 
+    # In-frame indel HGVSp corpus. Compared against the Ensembl REST VEP
+    # endpoint rather than the Docker image, so it needs network access but no
+    # local GFF3/FASTA beyond what fastVEP itself uses. Fails the run on a
+    # malformed or missing protein description; see compare_hgvsp_rest.py.
+    local inframe_vcf="$SCRIPT_DIR/human/inframe_indels_GRCh38.vcf"
+    if [[ -f "$inframe_vcf" ]]; then
+        echo ""
+        echo "--- In-frame indel HGVSp (343 variants, vs Ensembl REST) ---"
+        local inframe_out="$RESULTS_DIR/fastvep_inframe_indels.json"
+        fastvep annotate -i "$inframe_vcf" --gff3 "$human_gff3" --fasta "$human_fasta" \
+            --hgvs --symbol --canonical --output-format json -o "$inframe_out"
+        python3 "$SCRIPT_DIR/compare_hgvsp_rest.py" "$inframe_vcf" \
+            --fastvep-json "$inframe_out"
+    fi
+
     # chr22 1KGP validation
     local chr22_vcf="$SCRIPT_DIR/human/chr22_1kgp.vcf"
     if [[ -f "$chr22_vcf" ]]; then
