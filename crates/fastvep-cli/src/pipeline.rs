@@ -1135,12 +1135,19 @@ pub fn run_annotate(config: AnnotateConfig) -> Result<()> {
                                             }
                                         } else if aa.1 == "-"
                                             || ac.consequences.contains(&Consequence::InframeDeletion)
+                                            || ac.consequences.contains(&Consequence::InframeInsertion)
                                         {
-                                            // In-frame deletion / delins (frameshift handled
-                                            // above). aa.0 holds the deleted residues, aa.1 the
-                                            // replacement ("-" for a pure deletion).
-                                            ann.hgvsp = fastvep_hgvs::hgvsp_inframe_deletion(
-                                                &versioned_pid, ps, &aa.0, &aa.1,
+                                            // In-frame indel; frameshift handled above.
+                                            // aa.0 is the reference residues, aa.1 the
+                                            // replacement ("-" for a pure deletion). The peptide
+                                            // lets hgvsp_inframe_indel apply the HGVS 3'-rule; it
+                                            // degrades gracefully without.
+                                            ann.hgvsp = fastvep_hgvs::hgvsp_inframe_indel(
+                                                &versioned_pid,
+                                                ps,
+                                                &aa.0,
+                                                &aa.1,
+                                                tr.peptide.as_deref().map(str::as_bytes),
                                             );
                                         } else {
                                             let ref_aa_byte = aa.0.as_bytes().first().copied().unwrap_or(b'X');
