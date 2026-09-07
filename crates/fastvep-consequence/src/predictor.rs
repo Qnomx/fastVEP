@@ -2770,11 +2770,7 @@ mod tests {
             // CDS 6-9 covers Ala2's third base and all of Ala3; `TTGA` leaves
             // Ala2 as `GCT` and makes Ala3 `TGA`.
             let ac = delins_at(strand, 6, "TGCT", "TTGA");
-            assert_eq!(
-                ac.consequences,
-                vec![Consequence::StopGained],
-                "{strand:?}"
-            );
+            assert_eq!(ac.consequences, vec![Consequence::StopGained], "{strand:?}");
             assert_eq!(ac.impact, Impact::High, "{strand:?}");
             assert_eq!(
                 ac.amino_acids,
