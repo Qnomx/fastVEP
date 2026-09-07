@@ -2641,6 +2641,154 @@ mod tests {
         }
     }
 
+    // ---- equal-length multi-base substitutions ----
+    //
+    // An equal-length replacement is the one shape with no length delta, so
+    // `frameshift`, both in-frame terms and `protein_altering_variant` all
+    // decline by construction and the term comes from the residue comparison
+    // alone: `missense_variant`, `synonymous_variant` or `stop_gained`. It is
+    // also the shape that exercises the codon window with nothing else varying
+    // - the reference and the replacement contribute the same number of bases,
+    // so a window that stopped at the first codon, or a replacement that was
+    // complemented without being reversed, changes the answer and nothing else
+    // masks it.
+
+    /// Two bases replaced inside a single codon. The window is that one codon
+    /// and the trailing reference base stays lowercase.
+    #[test]
+    fn an_equal_length_change_inside_one_codon_is_missense() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            // CDS 4-5 is the first two bases of Ala2's `GCt`; `GC` -> `TG`
+            // makes the codon `TGT`, Cys.
+            let ac = delins_at(strand, 4, "GC", "TG");
+            assert_eq!(
+                ac.consequences,
+                vec![Consequence::MissenseVariant],
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.amino_acids,
+                Some(("A".to_string(), "C".to_string())),
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.codons,
+                Some(("GCt".to_string(), "TGt".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
+    /// A whole codon replaced. Every base of the window is replaced, so none of
+    /// it stays lowercase.
+    #[test]
+    fn an_equal_length_change_replacing_a_whole_codon_is_missense() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            // CDS 4-6 is all of Ala2's `GCT`; `TGG` is Trp.
+            let ac = delins_at(strand, 4, "GCT", "TGG");
+            assert_eq!(
+                ac.consequences,
+                vec![Consequence::MissenseVariant],
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.amino_acids,
+                Some(("A".to_string(), "W".to_string())),
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.codons,
+                Some(("GCT".to_string(), "TGG".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
+    /// Two bases replaced across a codon boundary. The window is both codons
+    /// the reference allele touches, and both residues are reported - reading
+    /// one codon from the first base of the change drops the second residue's
+    /// base and leaves that residue unchanged.
+    #[test]
+    fn an_equal_length_change_crossing_a_codon_boundary_spans_both_codons() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            // CDS 6 is Ala2's third base and CDS 7 is Ala3's first; `TG` ->
+            // `AC` makes the pair `GCA` `CCT`, Ala Pro.
+            let ac = delins_at(strand, 6, "TG", "AC");
+            assert_eq!(
+                ac.consequences,
+                vec![Consequence::MissenseVariant],
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.amino_acids,
+                Some(("AA".to_string(), "AP".to_string())),
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.codons,
+                Some(("gcTGct".to_string(), "gcACct".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
+    /// Two codons replaced, one resolving to the same residue and one not. The
+    /// change is `missense_variant`: `synonymous_variant` is the answer only
+    /// when the whole window's peptide is unchanged, so a window truncated to
+    /// its first codon reports the synonymous half and calls the variant
+    /// synonymous.
+    #[test]
+    fn an_equal_length_change_pairing_a_synonymous_residue_with_a_missense_one_is_missense() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            // CDS 4-9 is Ala2 Ala3 (`GCTGCT`); `GCCTGG` keeps Ala2 as Ala
+            // through a different codon and makes Ala3 Trp.
+            let ac = delins_at(strand, 4, "GCTGCT", "GCCTGG");
+            assert_eq!(
+                ac.consequences,
+                vec![Consequence::MissenseVariant],
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.amino_acids,
+                Some(("AA".to_string(), "AW".to_string())),
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.codons,
+                Some(("GCTGCT".to_string(), "GCCTGG".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
+    /// A terminator created in the second codon of the window. The first codon
+    /// is left resolving to its reference residue, so the stop is reachable
+    /// only from the part of the window past the first codon.
+    #[test]
+    fn an_equal_length_change_creating_a_stop_in_the_second_codon_is_stop_gained() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            // CDS 6-9 covers Ala2's third base and all of Ala3; `TTGA` leaves
+            // Ala2 as `GCT` and makes Ala3 `TGA`.
+            let ac = delins_at(strand, 6, "TGCT", "TTGA");
+            assert_eq!(
+                ac.consequences,
+                vec![Consequence::StopGained],
+                "{strand:?}"
+            );
+            assert_eq!(ac.impact, Impact::High, "{strand:?}");
+            assert_eq!(
+                ac.amino_acids,
+                Some(("AA".to_string(), "A*".to_string())),
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.codons,
+                Some(("gcTGCT".to_string(), "gcTTGA".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
     /// A delins over the initiator is `start_lost`, and that outranks the length
     /// change. Ensembl asks whether the reference residues survived at either
     /// end of the replacement, not whether some ATG still sits at the coding
