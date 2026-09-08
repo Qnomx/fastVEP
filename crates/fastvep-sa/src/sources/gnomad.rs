@@ -21,6 +21,7 @@ use crate::common::AnnotationRecord;
 use crate::fields::{Field, FieldType};
 use crate::writer_v2::{Osa2Metadata, Osa2Record};
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 
@@ -926,6 +927,90 @@ pub struct GnomadOsa2Iter<'a, R: BufRead> {
     field_names: Option<FieldNames>,
 }
 
+/// Data lines parsed per batch. Lines are read sequentially — gzip decode is
+/// single-threaded — but the per-line work is fanned out across cores. Bounded
+/// so peak memory stays flat on gnomAD's very wide INFO columns.
+const PARSE_BATCH_LINES: usize = 16_384;
+
+/// Encode one VCF data line as zero or more `.osa2` records, one per
+/// non-symbolic alternate allele. A free function so the batch below and any
+/// sequential caller share it and cannot drift apart.
+fn osa2_records_for_line(
+    line: &str,
+    fields: &[Field],
+    field_names: &FieldNames,
+    chrom_to_idx: &HashMap<String, u16>,
+) -> Vec<Osa2Record> {
+    let cols: Vec<&str> = line.splitn(9, '\t').collect();
+    if cols.len() < 8 {
+        return Vec::new();
+    }
+
+    let chrom = normalize_chrom(cols[0]);
+    if !chrom_to_idx.contains_key(&chrom) {
+        return Vec::new();
+    }
+    let pos: u32 = match cols[1].parse() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let ref_allele = cols[3].as_bytes().to_vec();
+    let alt_field = cols[4];
+    let filter_column = cols[6];
+    let info_map = parse_info(cols[7]);
+
+    let all_afs = split_info_values(info_map.get(&field_names.af).map(|s| s.as_str()));
+    // AN is a per-site (Number=1) value; AF/AC/nhomalt are per-allele.
+    let an = all_from(&info_map, &field_names.an);
+    let all_acs = split_info_values(info_map.get(&field_names.ac).map(|s| s.as_str()));
+    let all_nh = split_info_values(info_map.get(&field_names.nhomalt).map(|s| s.as_str()));
+
+    let mut out = Vec::new();
+    for (ai, alt) in alt_field.split(',').enumerate() {
+        if alt == "." || alt == "*" {
+            continue;
+        }
+        // Value order MUST match `gnomad_osa2_fields()`.
+        let mut values = Vec::with_capacity(fields.len());
+        values.push(enc_float(&fields[0], all_afs.get(ai).map(|s| s.as_str())));
+        values.push(enc_int(&fields[1], an.first().map(|s| s.as_str())));
+        values.push(enc_int(&fields[2], all_acs.get(ai).map(|s| s.as_str())));
+        values.push(enc_int(&fields[3], all_nh.get(ai).map(|s| s.as_str())));
+        for (pi, pop) in POPULATIONS.iter().enumerate() {
+            let base = 4 + pi * COLUMNS_PER_POPULATION;
+            let key = field_names.af_pop_key(pop);
+            let vals = split_info_values(info_map.get(&key).map(|s| s.as_str()));
+            values.push(enc_float(&fields[base], vals.get(ai).map(|s| s.as_str())));
+            for (ci, stat) in POP_COUNTS.iter().enumerate() {
+                let field = &fields[base + 1 + ci];
+                values.push(
+                    match pop_count_value(&info_map, field_names, *stat, pop, ai) {
+                        Some(n) => field.encode_int(n),
+                        None => field.missing_value,
+                    },
+                );
+            }
+        }
+        let ext_off = extended_offset();
+        for (ei, (_, value)) in extended_values(&info_map, filter_column, ai, field_names)
+            .into_iter()
+            .enumerate()
+        {
+            values.push(encode_ext(&fields[ext_off + ei], value));
+        }
+
+        out.push(Osa2Record {
+            chrom: chrom.clone(),
+            position: pos,
+            ref_allele: ref_allele.clone(),
+            alt_allele: alt.as_bytes().to_vec(),
+            values,
+            json_blob: None,
+        });
+    }
+    out
+}
+
 impl<R: BufRead> Iterator for GnomadOsa2Iter<'_, R> {
     type Item = Result<Osa2Record>;
 
@@ -935,97 +1020,42 @@ impl<R: BufRead> Iterator for GnomadOsa2Iter<'_, R> {
                 return Some(Ok(record));
             }
 
-            let line = match self.lines.next()? {
-                Ok(l) => l,
-                Err(e) => return Some(Err(e).context("Reading gnomAD VCF line")),
-            };
-
-            if line.starts_with('#') {
-                if let Some(id) = parse_info_id(&line) {
-                    self.info_ids.insert(id.to_string());
-                }
-                continue;
-            }
-
-            let field_names = self
-                .field_names
-                .get_or_insert_with(|| detect_field_names(&self.info_ids));
-
-            let cols: Vec<&str> = line.splitn(9, '\t').collect();
-            if cols.len() < 8 {
-                continue;
-            }
-
-            let chrom = normalize_chrom(cols[0]);
-            if !self.chrom_to_idx.contains_key(&chrom) {
-                continue;
-            }
-            let pos: u32 = match cols[1].parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let ref_allele = cols[3].as_bytes().to_vec();
-            let alt_field = cols[4];
-            let filter_column = cols[6];
-            let info_map = parse_info(cols[7]);
-
-            let all_afs = split_info_values(info_map.get(&field_names.af).map(|s| s.as_str()));
-            // AN is a per-site (Number=1) value; AF/AC/nhomalt are per-allele.
-            let an = all_from(&info_map, &field_names.an);
-            let all_acs = split_info_values(info_map.get(&field_names.ac).map(|s| s.as_str()));
-            let all_nh = split_info_values(info_map.get(&field_names.nhomalt).map(|s| s.as_str()));
-
-            for (ai, alt) in alt_field.split(',').enumerate() {
-                if alt == "." || alt == "*" {
+            // Header lines are read sequentially: they decide the INFO naming
+            // scheme every data line is then parsed against.
+            let mut batch: Vec<String> = Vec::with_capacity(PARSE_BATCH_LINES);
+            while batch.len() < PARSE_BATCH_LINES {
+                let line = match self.lines.next() {
+                    Some(Ok(l)) => l,
+                    Some(Err(e)) => return Some(Err(e).context("Reading gnomAD VCF line")),
+                    None => break,
+                };
+                if line.starts_with('#') {
+                    if let Some(id) = parse_info_id(&line) {
+                        self.info_ids.insert(id.to_string());
+                    }
                     continue;
                 }
-                // Value order MUST match `gnomad_osa2_fields()`.
-                let mut values = Vec::with_capacity(self.fields.len());
-                values.push(enc_float(
-                    &self.fields[0],
-                    all_afs.get(ai).map(|s| s.as_str()),
-                ));
-                values.push(enc_int(&self.fields[1], an.first().map(|s| s.as_str())));
-                values.push(enc_int(
-                    &self.fields[2],
-                    all_acs.get(ai).map(|s| s.as_str()),
-                ));
-                values.push(enc_int(&self.fields[3], all_nh.get(ai).map(|s| s.as_str())));
-                for (pi, pop) in POPULATIONS.iter().enumerate() {
-                    let base = 4 + pi * COLUMNS_PER_POPULATION;
-                    let key = field_names.af_pop_key(pop);
-                    let vals = split_info_values(info_map.get(&key).map(|s| s.as_str()));
-                    values.push(enc_float(
-                        &self.fields[base],
-                        vals.get(ai).map(|s| s.as_str()),
-                    ));
-                    for (ci, stat) in POP_COUNTS.iter().enumerate() {
-                        let field = &self.fields[base + 1 + ci];
-                        values.push(
-                            match pop_count_value(&info_map, field_names, *stat, pop, ai) {
-                                Some(n) => field.encode_int(n),
-                                None => field.missing_value,
-                            },
-                        );
-                    }
-                }
-                let ext_off = extended_offset();
-                for (ei, (_, value)) in extended_values(&info_map, filter_column, ai, field_names)
-                    .into_iter()
-                    .enumerate()
-                {
-                    values.push(encode_ext(&self.fields[ext_off + ei], value));
-                }
-
-                self.pending.push_back(Osa2Record {
-                    chrom: chrom.clone(),
-                    position: pos,
-                    ref_allele: ref_allele.clone(),
-                    alt_allele: alt.as_bytes().to_vec(),
-                    values,
-                    json_blob: None,
-                });
+                batch.push(line);
             }
+            if batch.is_empty() {
+                return None;
+            }
+
+            if self.field_names.is_none() {
+                self.field_names = Some(detect_field_names(&self.info_ids));
+            }
+            let field_names = self.field_names.as_ref().expect("set above");
+            let fields = self.fields.as_slice();
+            let chrom_to_idx = self.chrom_to_idx;
+            // rayon preserves input order, so the record stream is identical to a
+            // sequential parse.
+            let records: Vec<Osa2Record> = batch
+                .par_iter()
+                .flat_map_iter(|line| {
+                    osa2_records_for_line(line, fields, field_names, chrom_to_idx)
+                })
+                .collect();
+            self.pending.extend(records);
         }
     }
 }
@@ -1260,6 +1290,64 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=not_a_number;AC=garbage;nhomalt=.
         let mut m = HashMap::new();
         m.insert("chr1".to_string(), 0u16);
         m
+    }
+
+    #[test]
+    fn test_osa2_batched_parse_matches_a_sequential_one() {
+        // The parse fans batches of lines across cores. rayon preserves input
+        // order, but nothing else guarantees the batched stream equals a
+        // line-by-line one, and a divergence here silently changes every built
+        // database. Enough records to cross a batch boundary at any size.
+        let mut vcf = String::from(
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=AF,Number=A,Type=Float,Description=\"AF\">\n\
+             ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"AN\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+        );
+        for i in 0..500u32 {
+            // Vary allele count, contig validity and FILTER so the skip paths and
+            // the multi-allelic split are both exercised inside a batch.
+            let (alt, filt) = match i % 3 {
+                0 => ("T", "PASS"),
+                1 => ("T,A", "AC0"),
+                _ => ("T", "AS_VQSR"),
+            };
+            let chrom = if i % 97 == 0 { "chrUn" } else { "chr1" };
+            vcf.push_str(&format!(
+                "{chrom}\t{}\t.\tA\t{alt}\t.\t{filt}\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_nfe=5e-4;AC_nfe=30;AN_nfe=60000\n",
+                1000 + i
+            ));
+        }
+
+        let map = chr1_map();
+        let batched: Vec<Osa2Record> = iter_gnomad_osa2(vcf.as_bytes(), &map)
+            .collect::<Result<_>>()
+            .unwrap();
+
+        // The same lines, one at a time, through the function the batch calls.
+        let fields = gnomad_osa2_fields();
+        let mut info_ids = HashSet::new();
+        for line in vcf.lines().filter(|l| l.starts_with('#')) {
+            if let Some(id) = parse_info_id(line) {
+                info_ids.insert(id.to_string());
+            }
+        }
+        let field_names = detect_field_names(&info_ids);
+        let sequential: Vec<Osa2Record> = vcf
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .flat_map(|l| osa2_records_for_line(l, &fields, &field_names, &map))
+            .collect();
+
+        assert!(!batched.is_empty());
+        assert_eq!(batched.len(), sequential.len());
+        for (b, q) in batched.iter().zip(sequential.iter()) {
+            assert_eq!(b.chrom, q.chrom);
+            assert_eq!(b.position, q.position);
+            assert_eq!(b.ref_allele, q.ref_allele);
+            assert_eq!(b.alt_allele, q.alt_allele);
+            assert_eq!(b.values, q.values);
+        }
     }
 
     #[test]
