@@ -113,7 +113,11 @@ impl SaWriter {
 
             let chrom_name = &chrom_map[record.chrom_idx as usize];
             if current_chrom.as_deref() != Some(chrom_name.as_str()) {
-                finalize_block(&mut block, current_chrom.as_deref().unwrap_or(""), &mut blocks);
+                finalize_block(
+                    &mut block,
+                    current_chrom.as_deref().unwrap_or(""),
+                    &mut blocks,
+                );
                 current_chrom = Some(chrom_name.clone());
             }
 
@@ -130,7 +134,11 @@ impl SaWriter {
             }
         }
 
-        finalize_block(&mut block, current_chrom.as_deref().unwrap_or(""), &mut blocks);
+        finalize_block(
+            &mut block,
+            current_chrom.as_deref().unwrap_or(""),
+            &mut blocks,
+        );
         Ok(blocks)
     }
 
@@ -398,8 +406,7 @@ mod tests {
         let mut positions = Vec::new();
         let mut block_count = 0;
         while cursor < out.len() {
-            let len =
-                u32::from_le_bytes(out[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(out[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
             let entries = SaBlock::decompress(&out[cursor..cursor + len]).unwrap();
             positions.extend(entries.iter().map(|e| e.position));
