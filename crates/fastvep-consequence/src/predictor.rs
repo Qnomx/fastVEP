@@ -2643,23 +2643,16 @@ mod tests {
 
     // ---- equal-length multi-base substitutions ----
     //
-    // An equal-length replacement is the one shape with no length delta, so
-    // `frameshift`, both in-frame terms and `protein_altering_variant` all
-    // decline by construction and the term comes from the residue comparison
-    // alone: `missense_variant`, `synonymous_variant` or `stop_gained`. It is
-    // also the shape that exercises the codon window with nothing else varying
-    // - the reference and the replacement contribute the same number of bases,
-    // so a window that stopped at the first codon, or a replacement that was
-    // complemented without being reversed, changes the answer and nothing else
-    // masks it.
+    // With no length delta, `frameshift`, both in-frame terms and
+    // `protein_altering_variant` all decline, so the term comes from the
+    // residue comparison alone. Nothing else masks a window that stopped at the
+    // first codon, or a replacement complemented without being reversed.
 
-    /// Two bases replaced inside a single codon. The window is that one codon
-    /// and the trailing reference base stays lowercase.
+    /// The window is that one codon; the trailing reference base stays lower.
     #[test]
     fn an_equal_length_change_inside_one_codon_is_missense() {
         for strand in [Strand::Forward, Strand::Reverse] {
-            // CDS 4-5 is the first two bases of Ala2's `GCt`; `GC` -> `TG`
-            // makes the codon `TGT`, Cys.
+            // CDS 4-5 is Ala2's `GC`; `TG` makes the codon `TGT`, Cys.
             let ac = delins_at(strand, 4, "GC", "TG");
             assert_eq!(
                 ac.consequences,
@@ -2679,12 +2672,11 @@ mod tests {
         }
     }
 
-    /// A whole codon replaced. Every base of the window is replaced, so none of
-    /// it stays lowercase.
+    /// Every base of the window is replaced, so none of it stays lower.
     #[test]
     fn an_equal_length_change_replacing_a_whole_codon_is_missense() {
         for strand in [Strand::Forward, Strand::Reverse] {
-            // CDS 4-6 is all of Ala2's `GCT`; `TGG` is Trp.
+            // CDS 4-6 is Ala2's `GCT`; `TGG` is Trp.
             let ac = delins_at(strand, 4, "GCT", "TGG");
             assert_eq!(
                 ac.consequences,
@@ -2704,15 +2696,13 @@ mod tests {
         }
     }
 
-    /// Two bases replaced across a codon boundary. The window is both codons
-    /// the reference allele touches, and both residues are reported - reading
-    /// one codon from the first base of the change drops the second residue's
-    /// base and leaves that residue unchanged.
+    /// The window is both codons the reference touches. Reading one codon from
+    /// the first changed base drops the second residue's base.
     #[test]
     fn an_equal_length_change_crossing_a_codon_boundary_spans_both_codons() {
         for strand in [Strand::Forward, Strand::Reverse] {
-            // CDS 6 is Ala2's third base and CDS 7 is Ala3's first; `TG` ->
-            // `AC` makes the pair `GCA` `CCT`, Ala Pro.
+            // CDS 6-7 spans Ala2's third base and Ala3's first; `AC` makes
+            // `GCA` `CCT`, Ala Pro.
             let ac = delins_at(strand, 6, "TG", "AC");
             assert_eq!(
                 ac.consequences,
@@ -2732,16 +2722,14 @@ mod tests {
         }
     }
 
-    /// Two codons replaced, one resolving to the same residue and one not. The
-    /// change is `missense_variant`: `synonymous_variant` is the answer only
-    /// when the whole window's peptide is unchanged, so a window truncated to
-    /// its first codon reports the synonymous half and calls the variant
-    /// synonymous.
+    /// `synonymous_variant` holds only when the whole window's peptide is
+    /// unchanged, so a window truncated to its first codon reports the
+    /// synonymous half and calls the variant synonymous.
     #[test]
     fn an_equal_length_change_pairing_a_synonymous_residue_with_a_missense_one_is_missense() {
         for strand in [Strand::Forward, Strand::Reverse] {
-            // CDS 4-9 is Ala2 Ala3 (`GCTGCT`); `GCCTGG` keeps Ala2 as Ala
-            // through a different codon and makes Ala3 Trp.
+            // CDS 4-9 is Ala2 Ala3; `GCCTGG` keeps Ala2 through a different
+            // codon and makes Ala3 Trp.
             let ac = delins_at(strand, 4, "GCTGCT", "GCCTGG");
             assert_eq!(
                 ac.consequences,
@@ -2761,13 +2749,12 @@ mod tests {
         }
     }
 
-    /// A terminator created in the second codon of the window. The first codon
-    /// is left resolving to its reference residue, so the stop is reachable
-    /// only from the part of the window past the first codon.
+    /// The first codon keeps its reference residue, so the stop is reachable
+    /// only past it.
     #[test]
     fn an_equal_length_change_creating_a_stop_in_the_second_codon_is_stop_gained() {
         for strand in [Strand::Forward, Strand::Reverse] {
-            // CDS 6-9 covers Ala2's third base and all of Ala3; `TTGA` leaves
+            // CDS 6-9 spans Ala2's third base and all of Ala3; `TTGA` leaves
             // Ala2 as `GCT` and makes Ala3 `TGA`.
             let ac = delins_at(strand, 6, "TGCT", "TTGA");
             assert_eq!(ac.consequences, vec![Consequence::StopGained], "{strand:?}");

@@ -150,14 +150,9 @@ const FAF_FLOATS: &[(&str, &str, &str)] = &[
 /// The genetic-ancestry group a grpmax FAF was drawn from, as (INFO key,
 /// output alias, description).
 ///
-/// `faf95Max` alone says how common the variant is in the group where it is
-/// commonest; this says which group that is. A founder variant common in one
-/// ancestry and absent elsewhere reads very differently from one at the same
-/// frequency everywhere, and only this field separates them.
-///
-/// Stored as a categorical column over [`POPULATIONS`], which is the
-/// vocabulary gnomAD draws these codes from. A code outside it encodes as
-/// absent: the frequency remains, only the attribution is lost.
+/// Separates a founder variant common in one ancestry from one at the same
+/// frequency everywhere. A categorical column over [`POPULATIONS`]; a code
+/// outside that vocabulary encodes as absent, keeping the frequency.
 const FAF_CATEGORICALS: &[(&str, &str, &str)] = &[(
     "fafmax_faf95_max_gen_anc",
     "faf95MaxGenAnc",
@@ -171,12 +166,10 @@ enum ExtValue {
     Int(Option<i64>),
     Float(Option<f64>),
     Flag(bool),
-    /// A [`POPULATIONS`] index, for a categorical column. `None` when the
-    /// value is absent or is a code outside that vocabulary.
+    /// A [`POPULATIONS`] index. `None` when absent or outside that vocabulary.
     Category(Option<u32>),
 }
 
-/// Resolve a genetic-ancestry code to its [`POPULATIONS`] index.
 fn population_index(value: &str) -> Option<u32> {
     POPULATIONS
         .iter()
@@ -247,25 +240,19 @@ fn extended_values(
 
 /// Whether the VCF FILTER column lists `name`.
 ///
-/// FILTER is a semicolon-separated list, or `PASS` when nothing fired.
+/// FILTER is a semicolon-separated list, or `PASS` / `.` when nothing fired.
 fn filter_has(filter_column: &str, name: &str) -> bool {
     filter_column.split(';').any(|f| f == name)
 }
 
-/// The FILTER value that means no filter fired.
 const FILTER_PASS: &str = "PASS";
 
 /// Reject a FILTER column outside the vocabulary [`FILTER_FLAGS`] models.
 ///
-/// The gnomAD v4.0/v4.1 VCF header declares exactly four FILTER IDs — `AC0`,
-/// `AS_VQSR`, `InbreedingCoeff`, `PASS` — and [`FILTER_FLAGS`] carries the
-/// three non-`PASS` ones. Anything else encodes as three unset flags, which is
-/// indistinguishable from `PASS`, and `PASS` is what permits benign frequency
-/// evidence. So an unmodelled verdict is not a value to pass through: a `.` or
-/// empty column records no verdict at all, and an unrecognised name means the
-/// file is a release whose vocabulary differs — v2.1 used `RF`, `LCR` and
-/// `SEGDUP`. Either way the flags this encoder would write are wrong, and the
-/// build stops rather than producing them.
+/// An unmodelled value encodes as three unset flags, which is indistinguishable
+/// from `PASS`, and `PASS` is what permits benign frequency evidence. v4.0/v4.1
+/// declare only `AC0`, `AS_VQSR`, `InbreedingCoeff` and `PASS`; v2.1 used `RF`,
+/// `LCR` and `SEGDUP`.
 fn validate_filter_column(filter_column: &str) -> Result<()> {
     if filter_column.is_empty() || filter_column == "." {
         anyhow::bail!(
@@ -297,10 +284,9 @@ struct FieldNames {
     an: String,
     ac: String,
     nhomalt: String,
-    /// Separator between a statistic's name and a population code: `_` in
-    /// every gnomAD release, `-` in some locally-processed files. The release
-    /// flavor is already carried by the four names above, so `AC_joint` and
-    /// `_` give `AC_joint_afr`.
+    /// Separator between a statistic name and a population code: `_` in every
+    /// gnomAD release, `-` in some locally-processed files. The names above
+    /// already carry the flavor, so `AC_joint` plus `_` gives `AC_joint_afr`.
     pop_separator: String,
 }
 
@@ -345,11 +331,9 @@ impl FieldNames {
 /// The per-population count statistics, in the order both encoders emit them
 /// after that population's AF.
 ///
-/// A per-population AF says how common the variant is in that group; it does
-/// not say how many alleles the estimate rests on. An AF of 1e-4 over 200
-/// alleles and the same AF over 200,000 are different observations, and only
-/// AC/AN separate them. `Hc` is the homozygote count, which is the observation
-/// ACMG BS2 asks for.
+/// An AF alone does not say how many alleles it rests on: 1e-4 over 200 alleles
+/// and 1e-4 over 200,000 are different observations. `Hc` is the homozygote
+/// count ACMG BS2 asks for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PopCount {
     Ac,
@@ -360,8 +344,7 @@ enum PopCount {
 const POP_COUNTS: &[PopCount] = &[PopCount::Ac, PopCount::An, PopCount::Hc];
 
 impl PopCount {
-    /// The suffix appended to the population code to form the output alias,
-    /// as in `nfeAc`.
+    /// Alias suffix, as in `nfeAc`.
     fn alias_suffix(self) -> &'static str {
         match self {
             PopCount::Ac => "Ac",
@@ -370,7 +353,6 @@ impl PopCount {
         }
     }
 
-    /// The INFO key holding this statistic for `pop` in this release flavor.
     fn info_key(self, names: &FieldNames, pop: &str) -> String {
         match self {
             PopCount::Ac => names.ac_pop_key(pop),
@@ -379,15 +361,13 @@ impl PopCount {
         }
     }
 
-    /// Whether gnomAD reports the statistic per alternate allele
-    /// (`Number=A`). AN is a property of the population's sample, not of an
-    /// allele, so it is reported once per site (`Number=1`).
+    /// AC and nhomalt are `Number=A`; AN describes the sample, not an allele,
+    /// so it is `Number=1`.
     fn per_allele(self) -> bool {
         self != PopCount::An
     }
 
-    /// The INFO key as it appears in the standard release, for the v2 field
-    /// descriptor's `field` metadata.
+    /// The standard-release INFO key, for the v2 descriptor's `field` metadata.
     fn canonical_field(self, pop: &str) -> String {
         self.info_key(&FieldNames::standard(), pop)
     }
@@ -402,7 +382,6 @@ impl PopCount {
     }
 }
 
-/// One population's value for a count statistic, sliced out of the INFO map.
 fn pop_count_value(
     info_map: &HashMap<String, String>,
     field_names: &FieldNames,
@@ -686,7 +665,7 @@ fn build_gnomad_json(
         }
     }
 
-    // Per-population AF, then the counts the AF was computed from.
+    // Per-population AF and counts
     for pop in POPULATIONS {
         let key = field_names.af_pop_key(pop);
         if let Some(val) = info_map.get(&key) {
@@ -800,9 +779,8 @@ fn count_field(field: &str, alias: &str, description: &str) -> Field {
     }
 }
 
-/// A column holding one of a fixed set of strings, stored as an index into
-/// that set. The vocabulary is written into the archive beside the values, so
-/// the reader renders the string rather than the index.
+/// A fixed set of strings, stored as an index into it. The vocabulary goes into
+/// the archive, so the reader renders the string rather than the index.
 fn categorical_field(field: &str, alias: &str, description: &str) -> Field {
     Field {
         field: field.into(),
@@ -870,8 +848,6 @@ fn encode_ext(field: &Field, value: ExtValue) -> u32 {
     }
 }
 
-/// Number of columns each population contributes: its AF, then one per entry
-/// of [`POP_COUNTS`].
 const COLUMNS_PER_POPULATION: usize = 1 + POP_COUNTS.len();
 
 /// Canonical gnomAD v2 (`.osa2`) field schema. The value vector produced by
@@ -1243,7 +1219,6 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=not_a_number;AC=garbage;nhomalt=.
         assert_eq!(names.af, "AF");
         assert_eq!(names.af_pop_key("afr"), "AF-afr");
         assert_eq!(names.af_pop_key("nfe"), "AF-nfe");
-        // The separator applies to every per-population statistic, not just AF.
         assert_eq!(names.ac_pop_key("nfe"), "AC-nfe");
         assert_eq!(names.an_pop_key("nfe"), "AN-nfe");
         assert_eq!(names.nhomalt_pop_key("nfe"), "nhomalt-nfe");
@@ -1487,7 +1462,6 @@ chr1\t600\t.\tA\tG\t.\tPASS\tAF=0.2;AN=1000;AC=200;nhomalt=20;non_par;AC_XY=37;A
 
     // ---- per-population counts and the grpmax FAF group ----
 
-    /// A record carrying the per-population counts and both grpmax FAFs.
     const POP_COUNT_VCF: &str = "\
 ##fileformat=VCFv4.2
 ##INFO=<ID=AF,Number=A,Type=Float,Description=\"AF\">
@@ -1498,16 +1472,12 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_nfe=0.0005
 
     #[test]
     fn test_v1_json_carries_per_population_counts() {
-        // A per-population AF says how common the variant is in that group and
-        // nothing about how many alleles the estimate rests on. Without the
-        // counts the two are indistinguishable.
         let records = parse_gnomad_vcf(POP_COUNT_VCF.as_bytes(), &chr1_map()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&records[0].json).unwrap();
         assert_eq!(v.get("nfeAc").and_then(|x| x.as_i64()), Some(30));
         assert_eq!(v.get("nfeAn").and_then(|x| x.as_i64()), Some(60000));
         assert_eq!(v.get("nfeHc").and_then(|x| x.as_i64()), Some(1));
         assert!(v.get("nfeAf").is_some());
-        // A population the record says nothing about carries no keys at all.
         assert!(v.get("sasAc").is_none());
         assert!(v.get("sasAf").is_none());
     }
@@ -1528,9 +1498,8 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_nfe=0.0005
 
     #[test]
     fn test_osa2_carries_per_population_counts_and_gen_anc() {
-        // The v1 JSON and the v2 columns are what the same consumer reads, so
-        // a field present in one and absent from the other is a field that
-        // disappears when the build format changes.
+        // A field in one encoder and not the other disappears when the build
+        // format changes.
         let recs: Vec<Osa2Record> = iter_gnomad_osa2(POP_COUNT_VCF.as_bytes(), &chr1_map())
             .collect::<Result<_>>()
             .unwrap();
@@ -1545,16 +1514,13 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_nfe=0.0005
             recs[0].values[idx("faf99Max")],
             fields[idx("faf99Max")].encode_float(0.0003)
         );
-        // The group is stored as an index into POPULATIONS, which the archive
-        // carries as the field's string table.
         let nfe = POPULATIONS.iter().position(|p| *p == "nfe").unwrap() as u32;
         assert_eq!(recs[0].values[idx("faf95MaxGenAnc")], nfe);
     }
 
     #[test]
     fn test_gnomad_string_tables_cover_every_categorical_field() {
-        // A categorical column whose table is never written decodes to the
-        // stored index rather than the string.
+        // Without its table, a categorical column decodes to the index.
         let fields = gnomad_osa2_fields();
         let tables = gnomad_string_tables();
         let categorical: Vec<usize> = fields
@@ -1576,9 +1542,8 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_nfe=0.0005
 
     #[test]
     fn test_gen_anc_outside_the_vocabulary_is_absent_not_misattributed() {
-        // The column is an index into POPULATIONS, so a code that is not one
-        // has no slot. Encoding it as some other group's index would attribute
-        // the frequency to the wrong ancestry.
+        // Encoding an unknown code as some other index would attribute the
+        // frequency to the wrong ancestry.
         let vcf = POP_COUNT_VCF.replace("gen_anc=nfe", "gen_anc=unheard_of");
         let records = parse_gnomad_vcf(vcf.as_bytes(), &chr1_map()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&records[0].json).unwrap();
@@ -1600,9 +1565,6 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_nfe=0.0005
 
     #[test]
     fn test_validate_filter_column_rejects_a_missing_verdict() {
-        // Three unset flags read as PASS, and PASS is what permits benign
-        // frequency evidence, so a record with no verdict must not be encoded
-        // as one that passed.
         for value in [".", ""] {
             let err = validate_filter_column(value).unwrap_err().to_string();
             assert!(err.contains("no QC verdict"), "{value:?}: {err}");
@@ -1611,8 +1573,7 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_nfe=0.0005
 
     #[test]
     fn test_validate_filter_column_rejects_an_unmodelled_filter_name() {
-        // The gnomAD v2 vocabulary. A release using it would encode every
-        // record as PASS.
+        // The v2.1 vocabulary; a release using it would read as all-PASS.
         for value in ["RF", "LCR", "SEGDUP", "PASS;RF"] {
             let err = validate_filter_column(value).unwrap_err().to_string();
             assert!(err.contains("Unrecognized"), "{value:?}: {err}");
@@ -1621,8 +1582,6 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=150000;AC=150;nhomalt=2;AF_nfe=0.0005
 
     #[test]
     fn test_both_encoders_stop_on_an_unmodelled_filter_value() {
-        // The guard belongs to the parse, so it holds whichever format the
-        // build writes.
         let vcf = POP_COUNT_VCF.replace("\tPASS\t", "\tSEGDUP\t");
         let v1 = parse_gnomad_vcf(vcf.as_bytes(), &chr1_map());
         assert!(v1.is_err(), "v1 parse accepted SEGDUP");
