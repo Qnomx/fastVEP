@@ -461,6 +461,9 @@ wget https://ftp.ncbi.nih.gov/snp/pre_build152/organisms/human_9606_b151_GRCh37p
 # gnomAD v2.1.1 for GRCh37 (v3+ is GRCh38 only)
 # Same pattern: one chr at a time, index, delete.
 # Note: gnomAD v2.1.1 does NOT have a Y chromosome file — that's expected.
+# Note: the gnomAD builder encodes v4.1's FILTER vocabulary. v2.1.1 also filters
+# on RF, which has no flag, so this build stops at its first RF site until RF is
+# added to FILTER_FLAGS in crates/fastvep-sa/src/sources/gnomad.rs.
 for chr in {1..22} X; do
   VCF="gnomad.genomes.r2.1.1.sites.${chr}.vcf.bgz"
   wget "https://storage.googleapis.com/gcp-public-data--gnomad/release/2.1.1/vcf/genomes/${VCF}"

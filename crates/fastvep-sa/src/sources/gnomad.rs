@@ -242,9 +242,52 @@ fn extended_values(
 
 /// Whether the VCF FILTER column lists `name`.
 ///
-/// FILTER is a semicolon-separated list, or `PASS` / `.` when nothing fired.
+/// FILTER is a semicolon-separated list of the filters that fired, or `PASS`
+/// when none did.
 fn filter_has(filter_column: &str, name: &str) -> bool {
     filter_column.split(';').any(|f| f == name)
+}
+
+/// Rejects a FILTER value that [`FILTER_FLAGS`] cannot represent.
+///
+/// A name with no flag leaves all three flags false, which is how `PASS` is
+/// encoded, so the record would read as having passed QC.
+fn check_filter_column(filter_column: &str, chrom: &str, pos: u32) -> Result<()> {
+    if filter_column == "PASS" {
+        return Ok(());
+    }
+    if filter_column.is_empty() || filter_column == "." {
+        anyhow::bail!(
+            "gnomAD FILTER column at {chrom}:{pos} is {}, which encodes identically to PASS. \
+             Every record must state a QC verdict; rebuild from a VCF that sets FILTER.",
+            if filter_column.is_empty() {
+                "empty"
+            } else {
+                "\".\""
+            }
+        );
+    }
+    for entry in filter_column.split(';') {
+        if entry == "PASS" {
+            anyhow::bail!(
+                "gnomAD FILTER column at {chrom}:{pos} lists PASS alongside other filters. \
+                 PASS is only valid as the sole value."
+            );
+        }
+        if !FILTER_FLAGS.iter().any(|(name, _, _)| *name == entry) {
+            anyhow::bail!(
+                "gnomAD FILTER column at {chrom}:{pos} names \"{entry}\", which has no flag and \
+                 so encodes identically to PASS. Known values are PASS, {}. Add \"{entry}\" to \
+                 FILTER_FLAGS before rebuilding.",
+                FILTER_FLAGS
+                    .iter()
+                    .map(|(name, _, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 /// INFO field names for a particular gnomAD release flavor.
@@ -555,6 +598,9 @@ impl<R: BufRead> Iterator for GnomadRecordIter<'_, R> {
             let ref_allele = fields[3].to_string();
             let alt_field = fields[4];
             let filter_column = fields[6];
+            if let Err(e) = check_filter_column(filter_column, &chrom, pos) {
+                return Some(Err(e));
+            }
             let info = fields[7];
 
             let info_map = parse_info(info);
@@ -940,7 +986,7 @@ fn osa2_records_for_line(
     fields: &[Field],
     field_names: &FieldNames,
     chrom_to_idx: &HashMap<String, u16>,
-) -> Vec<Osa2Record> {
+) -> Vec<Result<Osa2Record>> {
     let cols: Vec<&str> = line.splitn(9, '\t').collect();
     if cols.len() < 8 {
         return Vec::new();
@@ -957,6 +1003,9 @@ fn osa2_records_for_line(
     let ref_allele = cols[3].as_bytes().to_vec();
     let alt_field = cols[4];
     let filter_column = cols[6];
+    if let Err(e) = check_filter_column(filter_column, &chrom, pos) {
+        return vec![Err(e)];
+    }
     let info_map = parse_info(cols[7]);
 
     let all_afs = split_info_values(info_map.get(&field_names.af).map(|s| s.as_str()));
@@ -999,14 +1048,14 @@ fn osa2_records_for_line(
             values.push(encode_ext(&fields[ext_off + ei], value));
         }
 
-        out.push(Osa2Record {
+        out.push(Ok(Osa2Record {
             chrom: chrom.clone(),
             position: pos,
             ref_allele: ref_allele.clone(),
             alt_allele: alt.as_bytes().to_vec(),
             values,
             json_blob: None,
-        });
+        }));
     }
     out
 }
@@ -1049,12 +1098,19 @@ impl<R: BufRead> Iterator for GnomadOsa2Iter<'_, R> {
             let chrom_to_idx = self.chrom_to_idx;
             // rayon preserves input order, so the record stream is identical to a
             // sequential parse.
-            let records: Vec<Osa2Record> = batch
+            let items: Vec<Result<Osa2Record>> = batch
                 .par_iter()
                 .flat_map_iter(|line| {
                     osa2_records_for_line(line, fields, field_names, chrom_to_idx)
                 })
                 .collect();
+            let mut records = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Ok(record) => records.push(record),
+                    Err(e) => return Some(Err(e)),
+                }
+            }
             self.pending.extend(records);
         }
     }
@@ -1337,6 +1393,7 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF=0.001;AN=not_a_number;AC=garbage;nhomalt=.
             .lines()
             .filter(|l| !l.starts_with('#'))
             .flat_map(|l| osa2_records_for_line(l, &fields, &field_names, &map))
+            .map(|r| r.unwrap())
             .collect();
 
         assert!(!batched.is_empty());
@@ -1658,6 +1715,114 @@ chr1\t10001\t.\tA\tG\t.\tPASS\tAF_joint=0.001;AN_joint=150000;AC_joint=150;AC_jo
         let v: serde_json::Value = serde_json::from_str(&records[0].json).unwrap();
         assert!(v.get("faf95MaxGenAnc").is_none());
         assert!(v.get("faf95Max").is_some(), "the frequency itself survives");
+    }
+
+    fn vcf_with_filter(filter: &str) -> String {
+        format!(
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=AF,Number=A,Type=Float,Description=\"AF\">\n\
+             ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"AN\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t10001\t.\tA\tG\t.\t{filter}\tAF=0.001;AN=150000;AC=150;nhomalt=2\n"
+        )
+    }
+
+    /// (v1 `.osa`, v2 `.osa2`) errors, `None` where the value is accepted.
+    fn filter_errors(filter: &str) -> (Option<String>, Option<String>) {
+        let vcf = vcf_with_filter(filter);
+        let map = chr1_map();
+        let v1 = iter_gnomad_vcf(vcf.as_bytes(), &map)
+            .collect::<Result<Vec<_>>>()
+            .err()
+            .map(|e| e.to_string());
+        let v2 = iter_gnomad_osa2(vcf.as_bytes(), &map)
+            .collect::<Result<Vec<_>>>()
+            .err()
+            .map(|e| e.to_string());
+        (v1, v2)
+    }
+
+    #[test]
+    fn test_an_absent_filter_verdict_fails_the_build_on_both_encoders() {
+        for absent in [".", ""] {
+            let (v1, v2) = filter_errors(absent);
+            let v1 = v1.unwrap_or_else(|| panic!("v1 accepted FILTER {absent:?}"));
+            let v2 = v2.unwrap_or_else(|| panic!("v2 accepted FILTER {absent:?}"));
+            for msg in [&v1, &v2] {
+                assert!(msg.contains("chr1:10001"), "{msg}");
+                assert!(msg.contains("encodes identically to PASS"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_an_unrecognised_filter_name_fails_the_build_on_both_encoders() {
+        for unknown in ["RF", "SEGDUP", "AC0;RF", "AS_VQSR_2"] {
+            let (v1, v2) = filter_errors(unknown);
+            let v1 = v1.unwrap_or_else(|| panic!("v1 accepted FILTER {unknown:?}"));
+            let v2 = v2.unwrap_or_else(|| panic!("v2 accepted FILTER {unknown:?}"));
+            for msg in [&v1, &v2] {
+                assert!(msg.contains("chr1:10001"), "{msg}");
+                assert!(msg.contains("FILTER_FLAGS"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pass_alongside_another_filter_fails_the_build_on_both_encoders() {
+        for compound in ["PASS;AC0", "AC0;PASS"] {
+            let (v1, v2) = filter_errors(compound);
+            let v1 = v1.unwrap_or_else(|| panic!("v1 accepted FILTER {compound:?}"));
+            let v2 = v2.unwrap_or_else(|| panic!("v2 accepted FILTER {compound:?}"));
+            for msg in [&v1, &v2] {
+                assert!(msg.contains("only valid as the sole value"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_both_encoders_blame_the_same_record_when_several_are_bad() {
+        // The .osa2 parse fans lines across cores. Reporting whichever error a
+        // worker happened to finish first would name a different record per run
+        // and disagree with the .osa encoder on the same input.
+        let mut vcf = String::from(
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=AF,Number=A,Type=Float,Description=\"AF\">\n\
+             ##INFO=<ID=AN,Number=1,Type=Integer,Description=\"AN\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+        );
+        for i in 0..400u32 {
+            let filt = if i % 50 == 7 { "RF" } else { "PASS" };
+            vcf.push_str(&format!(
+                "chr1\t{}\t.\tA\tG\t.\t{filt}\tAF=0.001;AN=150000;AC=150;nhomalt=2\n",
+                1000 + i
+            ));
+        }
+        let map = chr1_map();
+        let first = "chr1:1007";
+        let v1 = iter_gnomad_vcf(vcf.as_bytes(), &map)
+            .collect::<Result<Vec<_>>>()
+            .unwrap_err()
+            .to_string();
+        assert!(v1.contains(first), "v1 blamed the wrong record: {v1}");
+        for _ in 0..20 {
+            let v2 = iter_gnomad_osa2(vcf.as_bytes(), &map)
+                .collect::<Result<Vec<_>>>()
+                .unwrap_err()
+                .to_string();
+            assert!(v2.contains(first), "v2 blamed the wrong record: {v2}");
+        }
+    }
+
+    #[test]
+    fn test_the_whole_known_vocabulary_is_accepted() {
+        let mut cases = vec!["PASS".to_string(), "AC0;AS_VQSR".to_string()];
+        cases.extend(FILTER_FLAGS.iter().map(|(name, _, _)| name.to_string()));
+        for accepted in cases {
+            let (v1, v2) = filter_errors(&accepted);
+            assert!(v1.is_none(), "v1 rejected FILTER {accepted:?}: {v1:?}");
+            assert!(v2.is_none(), "v2 rejected FILTER {accepted:?}: {v2:?}");
+        }
     }
 
     #[test]
