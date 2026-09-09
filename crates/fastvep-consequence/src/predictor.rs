@@ -2641,6 +2641,117 @@ mod tests {
         }
     }
 
+    /// Every other `delins_at` case changes length.
+    #[test]
+    fn an_equal_length_change_inside_one_codon_is_missense_on_either_strand() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            // CDS 4-5 lies inside Ala2's `GCT`, so the window is that codon.
+            let ac = delins_at(strand, 4, "GC", "AT");
+            assert!(
+                ac.consequences.contains(&Consequence::MissenseVariant),
+                "{strand:?}: expected missense_variant, got {:?}",
+                ac.consequences
+            );
+            assert_eq!(
+                ac.amino_acids,
+                Some(("A".to_string(), "I".to_string())),
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.codons,
+                Some(("GCt".to_string(), "ATt".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_equal_length_change_replacing_a_whole_codon_is_missense_on_either_strand() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let ac = delins_at(strand, 4, "GCT", "TGG");
+            assert!(
+                ac.consequences.contains(&Consequence::MissenseVariant),
+                "{strand:?}: expected missense_variant, got {:?}",
+                ac.consequences
+            );
+            assert_eq!(
+                ac.amino_acids,
+                Some(("A".to_string(), "W".to_string())),
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.codons,
+                Some(("GCT".to_string(), "TGG".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
+    /// Reading only the codon the variant starts in reported one changed residue
+    /// where two change.
+    #[test]
+    fn an_equal_length_change_crossing_a_codon_boundary_spans_both_codons() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            // CDS 6 is Ala2's last base, CDS 7 is Ala3's first.
+            let ac = delins_at(strand, 6, "TG", "AC");
+            assert!(
+                ac.consequences.contains(&Consequence::MissenseVariant),
+                "{strand:?}: expected missense_variant, got {:?}",
+                ac.consequences
+            );
+            assert_eq!(
+                ac.amino_acids,
+                Some(("AA".to_string(), "AP".to_string())),
+                "{strand:?}"
+            );
+            assert_eq!(
+                ac.codons,
+                Some(("gcTGct".to_string(), "gcACct".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_equal_length_change_with_one_synonymous_residue_is_still_missense() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let ac = delins_at(strand, 4, "GCTGCT", "GCCACT");
+            assert!(
+                ac.consequences.contains(&Consequence::MissenseVariant),
+                "{strand:?}: expected missense_variant, got {:?}",
+                ac.consequences
+            );
+            assert!(
+                !ac.consequences.contains(&Consequence::SynonymousVariant),
+                "{strand:?}: a changed residue must outrank synonymous, got {:?}",
+                ac.consequences
+            );
+            assert_eq!(
+                ac.amino_acids,
+                Some(("AA".to_string(), "AT".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_equal_length_change_creating_a_terminator_is_stop_gained_on_either_strand() {
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let ac = delins_at(strand, 4, "GCT", "TAA");
+            assert!(
+                ac.consequences.contains(&Consequence::StopGained),
+                "{strand:?}: expected stop_gained, got {:?}",
+                ac.consequences
+            );
+            assert_eq!(ac.impact, Impact::High, "{strand:?}");
+            assert_eq!(
+                ac.amino_acids,
+                Some(("A".to_string(), "*".to_string())),
+                "{strand:?}"
+            );
+        }
+    }
+
     /// A delins over the initiator is `start_lost`, and that outranks the length
     /// change. Ensembl asks whether the reference residues survived at either
     /// end of the replacement, not whether some ATG still sits at the coding
