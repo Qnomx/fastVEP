@@ -160,6 +160,7 @@ fn extended_values(
     info_map: &HashMap<String, String>,
     filter_column: &str,
     allele_idx: usize,
+    field_names: &FieldNames,
 ) -> Vec<(&'static str, ExtValue)> {
     let mut out = Vec::with_capacity(
         XY_ALLELE_INTS.len()
@@ -170,21 +171,21 @@ fn extended_values(
     );
 
     for (key, alias, _) in XY_ALLELE_INTS {
-        let vals = split_info_values(info_map.get(*key).map(|s| s.as_str()));
+        let vals = split_info_values(info_map.get(&field_names.ext_key(key)).map(|s| s.as_str()));
         out.push((
             *alias,
             ExtValue::Int(vals.get(allele_idx).and_then(|s| s.parse::<i64>().ok())),
         ));
     }
     for (key, alias, _) in XY_SITE_INTS {
-        let vals = split_info_values(info_map.get(*key).map(|s| s.as_str()));
+        let vals = split_info_values(info_map.get(&field_names.ext_key(key)).map(|s| s.as_str()));
         out.push((
             *alias,
             ExtValue::Int(vals.first().and_then(|s| s.parse::<i64>().ok())),
         ));
     }
     for (key, alias, _) in FAF_FLOATS {
-        let vals = split_info_values(info_map.get(*key).map(|s| s.as_str()));
+        let vals = split_info_values(info_map.get(&field_names.ext_key(key)).map(|s| s.as_str()));
         out.push((
             *alias,
             ExtValue::Float(vals.get(allele_idx).and_then(|s| s.parse::<f64>().ok())),
@@ -220,6 +221,9 @@ struct FieldNames {
     /// Format string for per-population AF, with `{}` substituted for the
     /// population code (e.g., `"AF_{}"` or `"AF_joint_{}"`).
     af_pop_template: String,
+    /// Suffix marking this release on the extended INFO keys: empty for the
+    /// separate exomes/genomes VCFs, `_joint` for the joint release.
+    flavor: String,
 }
 
 impl FieldNames {
@@ -230,6 +234,7 @@ impl FieldNames {
             ac: "AC".into(),
             nhomalt: "nhomalt".into(),
             af_pop_template: "AF_{}".into(),
+            flavor: String::new(),
         }
     }
 
@@ -240,6 +245,32 @@ impl FieldNames {
             ac: "AC_joint".into(),
             nhomalt: "nhomalt_joint".into(),
             af_pop_template: "AF_joint_{}".into(),
+            flavor: "_joint".into(),
+        }
+    }
+
+    /// The INFO key this release uses for an extended column declared under its
+    /// standard-release name.
+    ///
+    /// gnomAD appends the release flavor at the end of the key, except where the
+    /// key ends in a *sample stratifier* - a population code, or `XY` - which
+    /// qualifies the statistic and so stays outermost. From the v4.1 joint
+    /// header: `faf95` -> `faf95_joint` and
+    /// `fafmax_faf95_max_gen_anc` -> `fafmax_faf95_max_gen_anc_joint`, because
+    /// `_gen_anc` names part of the statistic rather than a subset of samples;
+    /// but `AC_XY` -> `AC_joint_XY`, the same shape as `AF_nfe` ->
+    /// `AF_joint_nfe`.
+    ///
+    /// Identity on the standard release, where `flavor` is empty. Per-population
+    /// keys do not come through here - [`FieldNames::pop_key`] already builds
+    /// them from a template that carries the flavor.
+    fn ext_key(&self, base: &str) -> String {
+        if self.flavor.is_empty() {
+            return base.to_string();
+        }
+        match base.strip_suffix("_XY") {
+            Some(statistic) => format!("{statistic}{}_XY", self.flavor),
+            None => format!("{base}{}", self.flavor),
         }
     }
 
@@ -524,7 +555,7 @@ fn build_gnomad_json(
     // Extended QC / stratified columns. Absent values and unset flags are
     // omitted entirely, so a site with nothing to report costs no bytes and an
     // older consumer that does not know these keys is unaffected.
-    for (alias, value) in extended_values(info_map, filter_column, allele_idx) {
+    for (alias, value) in extended_values(info_map, filter_column, allele_idx, field_names) {
         match value {
             ExtValue::Int(Some(n)) => parts.push(format!("\"{}\":{}", alias, n)),
             ExtValue::Float(Some(f)) if f.is_finite() => {
@@ -812,7 +843,7 @@ impl<R: BufRead> Iterator for GnomadOsa2Iter<'_, R> {
                     ));
                 }
                 let ext_off = extended_offset();
-                for (ei, (_, value)) in extended_values(&info_map, filter_column, ai)
+                for (ei, (_, value)) in extended_values(&info_map, filter_column, ai, field_names)
                     .into_iter()
                     .enumerate()
                 {
@@ -1155,7 +1186,7 @@ chr1\t600\t.\tA\tG\t.\tPASS\tAF=0.2;AN=1000;AC=200;nhomalt=20;non_par;AC_XY=37;A
         // positionally. If they ever fall out of order, every extended column
         // in a v2 database silently holds another column's value.
         let fields = extended_fields();
-        let values = extended_values(&HashMap::new(), "PASS", 0);
+        let values = extended_values(&HashMap::new(), "PASS", 0, &FieldNames::standard());
         assert_eq!(fields.len(), values.len());
         for (f, (alias, _)) in fields.iter().zip(values.iter()) {
             assert_eq!(&f.alias, alias, "extended schema and extraction diverged");
