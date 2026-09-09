@@ -195,7 +195,10 @@ fn extended_values(
         out.push((*alias, ExtValue::Flag(info_map.contains_key(*key))));
     }
     for (name, alias, _) in FILTER_FLAGS {
-        out.push((*alias, ExtValue::Flag(filter_has(filter_column, name))));
+        out.push((
+            *alias,
+            ExtValue::Flag(filter_fired(info_map, filter_column, name)),
+        ));
     }
 
     out
@@ -206,6 +209,39 @@ fn extended_values(
 /// FILTER is a semicolon-separated list, or `PASS` / `.` when nothing fired.
 fn filter_has(filter_column: &str, name: &str) -> bool {
     filter_column.split(';').any(|f| f == name)
+}
+
+/// INFO keys carrying the per-callset filter names in the joint release, as
+/// comma-separated lists (`exomes_filters=AC0,AS_VQSR`).
+const JOINT_FILTER_KEYS: &[&str] = &["exomes_filters", "genomes_filters"];
+
+/// Whether `name` fired for this record in any callset it was called in.
+///
+/// The separate exomes and genomes VCFs put the filter names in the FILTER
+/// column. The joint release cannot: it merges two callsets that were filtered
+/// independently, so its column records *which side* failed
+/// (`EXOMES_FILTERED` / `GENOMES_FILTERED` / `BOTH_FILTERED` / `PASS`) and the
+/// names themselves move into [`JOINT_FILTER_KEYS`].
+///
+/// Reading only the column there left all three flags unset, so a site that
+/// failed both callsets annotated exactly like a clean `PASS` - which is the
+/// reading that matters, because these flags exist to stop a filtered site
+/// being used as benign frequency evidence.
+///
+/// A name is reported if it fired in *either* callset. That is the conservative
+/// direction for a guard against trusting a frequency: a variant filtered in
+/// the exomes and clean in the genomes still has one untrustworthy component,
+/// and the flag says which filter fired, not how much of the merge it covers.
+/// Which side failed stays readable from the FILTER column itself.
+fn filter_fired(info_map: &HashMap<String, String>, filter_column: &str, name: &str) -> bool {
+    if filter_has(filter_column, name) {
+        return true;
+    }
+    JOINT_FILTER_KEYS.iter().any(|key| {
+        info_map
+            .get(*key)
+            .is_some_and(|v| v.split(',').any(|f| f == name))
+    })
 }
 
 /// INFO field names for a particular gnomAD release flavor.
