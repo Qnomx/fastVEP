@@ -226,13 +226,14 @@ const JOINT_FILTER_KEYS: &[&str] = &["exomes_filters", "genomes_filters"];
 /// Reading only the column there left all three flags unset, so a site that
 /// failed both callsets annotated exactly like a clean `PASS` - which is the
 /// reading that matters, because these flags exist to stop a filtered site
-/// being used as benign frequency evidence.
+/// being used as benign frequency evidence. 2,956 of the 3,339 chr21 records
+/// in the v4.1 joint release carry a filter, and none of them reported one.
 ///
 /// A name is reported if it fired in *either* callset. That is the conservative
 /// direction for a guard against trusting a frequency: a variant filtered in
 /// the exomes and clean in the genomes still has one untrustworthy component,
 /// and the flag says which filter fired, not how much of the merge it covers.
-/// Which side failed stays readable from the FILTER column itself.
+/// Which side failed remains readable from the FILTER column itself.
 fn filter_fired(info_map: &HashMap<String, String>, filter_column: &str, name: &str) -> bool {
     if filter_has(filter_column, name) {
         return true;
@@ -1287,6 +1288,150 @@ chr1\t600\t.\tA\tG\t.\tPASS\tAF=0.2;AN=1000;AC=200;nhomalt=20;non_par;AC_XY=37;A
             recs[1].values[idx("faf95Max")],
             fields[idx("faf95Max")].encode_float(0.24)
         );
+    }
+
+    // ---- the joint release ----
+    //
+    // Every INFO key below is copied from the real v4.1 joint header
+    // (`gnomad.joint.v4.1.sites.chr21.vcf.bgz`), which is the only thing that
+    // settles these names: a fixture written to match the parser would pass
+    // whatever the parser did.
+
+    /// A joint-release record, with the extended keys spelled as that release
+    /// spells them. Note `AC_joint_XY` (not `AC_XY`), `faf95_joint` (not
+    /// `faf95`), and `fafmax_faf95_max_gen_anc_joint` - the flavor goes after
+    /// the `_gen_anc` tail, but before the `XY` stratifier.
+    const JOINT_EXT_VCF: &str = "\
+##fileformat=VCFv4.2
+##INFO=<ID=AF_joint,Number=A,Type=Float,Description=\"Joint AF\">
+##INFO=<ID=AN_joint,Number=1,Type=Integer,Description=\"Joint AN\">
+##INFO=<ID=AC_joint,Number=A,Type=Integer,Description=\"Joint AC\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO
+chr1\t10001\t.\tA\tG\t.\tEXOMES_FILTERED\tAF_joint=0.2;AN_joint=1000;AC_joint=200;nhomalt_joint=20;AC_joint_XY=37;AN_joint_XY=400;faf95_joint=0.18;fafmax_faf95_max_joint=0.24;exomes_filters=AC0,AS_VQSR
+";
+
+    #[test]
+    fn test_joint_release_resolves_the_extended_columns() {
+        // Every one of these read as absent before the release flavor was
+        // applied to the extended keys, because the joint release qualifies
+        // them and the lookup used the standard-release spelling.
+        let records = parse_gnomad_vcf(JOINT_EXT_VCF.as_bytes(), &chr1_map()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&records[0].json).unwrap();
+
+        assert_eq!(v.get("allAcXY").and_then(|x| x.as_i64()), Some(37));
+        assert_eq!(v.get("allAnXY").and_then(|x| x.as_i64()), Some(400));
+        let faf95 = v.get("faf95").and_then(|x| x.as_f64()).unwrap();
+        assert!((faf95 - 0.18).abs() < 1e-6, "faf95 was {faf95}");
+        let faf_max = v.get("faf95Max").and_then(|x| x.as_f64()).unwrap();
+        assert!((faf_max - 0.24).abs() < 1e-6, "faf95Max was {faf_max}");
+    }
+
+    #[test]
+    fn test_ext_key_qualifies_the_statistic_not_the_stratifier() {
+        let joint = FieldNames::joint();
+        // The flavor lands at the end of the key ...
+        assert_eq!(joint.ext_key("faf95"), "faf95_joint");
+        assert_eq!(joint.ext_key("fafmax_faf95_max"), "fafmax_faf95_max_joint");
+        // ... including after `_gen_anc`, which names part of the statistic
+        // rather than a subset of samples.
+        assert_eq!(
+            joint.ext_key("fafmax_faf95_max_gen_anc"),
+            "fafmax_faf95_max_gen_anc_joint"
+        );
+        // ... but inside a sample stratifier, which stays outermost.
+        assert_eq!(joint.ext_key("AC_XY"), "AC_joint_XY");
+        assert_eq!(joint.ext_key("AN_XY"), "AN_joint_XY");
+
+        // Identity on the standard release.
+        let standard = FieldNames::standard();
+        for key in ["faf95", "fafmax_faf95_max", "AC_XY", "AN_XY"] {
+            assert_eq!(standard.ext_key(key), key);
+        }
+    }
+
+    #[test]
+    fn test_joint_filter_names_are_read_from_info_not_the_column() {
+        // The joint FILTER column says which side of the merge failed, never
+        // which filter fired. Reading it alone reported no filter at all for
+        // 2,956 of the 3,339 chr21 records in the v4.1 joint release - every
+        // one of them indistinguishable from a clean PASS.
+        let records = parse_gnomad_vcf(JOINT_EXT_VCF.as_bytes(), &chr1_map()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&records[0].json).unwrap();
+        assert_eq!(v.get("filterAc0").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(v.get("filterVqsr").and_then(|x| x.as_bool()), Some(true));
+        // Unset flags are omitted from the v1 JSON entirely.
+        assert!(v.get("filterInbreeding").is_none());
+    }
+
+    #[test]
+    fn test_filter_fired_reads_either_callset_and_splits_on_commas() {
+        let mut info = HashMap::new();
+        info.insert("exomes_filters".to_string(), "AC0,AS_VQSR".to_string());
+        info.insert("genomes_filters".to_string(), "InbreedingCoeff".to_string());
+
+        // A name from either callset counts, and the lists are comma-separated
+        // (`Number=.`), not semicolon-separated like the FILTER column.
+        for name in ["AC0", "AS_VQSR", "InbreedingCoeff"] {
+            assert!(
+                filter_fired(&info, "EXOMES_FILTERED", name),
+                "{name} not reported"
+            );
+        }
+        // A partial entry must not match: `AC0` is present, `AC` is not.
+        assert!(!filter_fired(&info, "PASS", "AC"));
+
+        // A merge verdict on its own reports no filter. The verdict says which
+        // side failed, not what failed, so with the per-callset lists absent
+        // there is nothing to report - and nothing may be invented.
+        let verdict_only = HashMap::new();
+        for verdict in ["EXOMES_FILTERED", "GENOMES_FILTERED", "BOTH_FILTERED"] {
+            for (name, _, _) in FILTER_FLAGS {
+                assert!(
+                    !filter_fired(&verdict_only, verdict, name),
+                    "{name} invented from {verdict}"
+                );
+            }
+        }
+
+        // With no joint keys present, only the column decides - the standard
+        // release is untouched.
+        let empty = HashMap::new();
+        assert!(filter_fired(&empty, "AC0;AS_VQSR", "AC0"));
+        assert!(!filter_fired(&empty, "PASS", "AC0"));
+    }
+
+    #[test]
+    fn test_osa2_joint_extended_columns_match_the_v1_json() {
+        // Both encoders walk the same extraction, so a fix that reached only
+        // one of them would disappear when the build format changed.
+        let recs: Vec<Osa2Record> = iter_gnomad_osa2(JOINT_EXT_VCF.as_bytes(), &chr1_map())
+            .collect::<Result<_>>()
+            .unwrap();
+        let fields = gnomad_osa2_fields();
+        let idx = |alias: &str| fields.iter().position(|f| f.alias == alias).unwrap();
+
+        assert_eq!(recs[0].values[idx("allAcXY")], 37);
+        assert_eq!(recs[0].values[idx("allAnXY")], 400);
+        assert_eq!(
+            recs[0].values[idx("faf95Max")],
+            fields[idx("faf95Max")].encode_float(0.24)
+        );
+        assert_eq!(recs[0].values[idx("filterAc0")], 1);
+        assert_eq!(recs[0].values[idx("filterVqsr")], 1);
+        assert_eq!(recs[0].values[idx("filterInbreeding")], 0);
+    }
+
+    #[test]
+    fn test_extended_field_descriptors_keep_the_standard_release_names() {
+        // The release flavor is resolved at read time only. If it leaked into
+        // the descriptor, the `.osa2` schema would depend on which release
+        // built it, and two databases of the same source would not be
+        // comparable.
+        let fields = extended_fields();
+        let by_alias = |alias: &str| fields.iter().find(|f| f.alias == alias).unwrap();
+        assert_eq!(by_alias("allAcXY").field, "AC_XY");
+        assert_eq!(by_alias("allAnXY").field, "AN_XY");
+        assert_eq!(by_alias("faf95Max").field, "fafmax_faf95_max");
     }
 
     #[test]
